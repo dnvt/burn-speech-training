@@ -1,0 +1,36 @@
+[package]
+name = "burn-speech-training"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+description = "End-to-end speech model training pipeline built on Burn — MFCC features, CTC loss, LibriSpeech loader, SpeechOcean762 evaluation"
+repository = "https://github.com/dnvt/burn-speech-training"
+keywords = ["burn", "speech", "ctc", "mfcc", "training"]
+categories = ["science", "multimedia::audio"]
+
+[features]
+default = ["ndarray"]
+ndarray = ["burn/ndarray", "burn/autodiff", "burn/std"]
+cuda = ["burn/cuda", "burn/autodiff", "burn/std"]
+wgpu = ["burn/wgpu", "burn/autodiff", "burn/std"]
+
+[dependencies]
+burn = { version = "0.21.0-pre.2", default-features = false }
+symphonia = { version = "0.5", features = ["all"] }
+realfft = "3.5"
+bitcode = { version = "0.6", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+rand = "0.9"
+tracing = "0.1"
+thiserror = "2"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+bitcode = { version = "0.6", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
