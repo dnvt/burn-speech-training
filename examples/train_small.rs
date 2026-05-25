@@ -1,27 +1,28 @@
 //! Quick-start: train SpeechAligner on synthetic data.
 //!
-//! Demonstrates the full training loop on CPU with randomly generated
-//! input features and CTC targets. No external data files needed.
+//! Demonstrates the training loop on CPU with a fixed synthetic batch and CTC
+//! targets. No external data files are needed.
 //!
 //! ```bash
 //! cargo run --example train_small --features ndarray
 //! ```
 //!
-//! Expected output: loss decreasing over 5 epochs, completing in < 1 second (release mode).
+//! Expected output: finite loss values and valid inference output shapes.
 
 use burn::backend::ndarray::NdArrayDevice;
 use burn::backend::{Autodiff, NdArray};
 use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
-use burn::tensor::{Distribution, Int, Shape, Tensor, TensorData};
+use burn::tensor::{Int, Shape, Tensor, TensorData};
 
+use burn_speech_training::error::{Error, Result};
 use burn_speech_training::loss::SpeechAlignerLossConfig;
 use burn_speech_training::model::SpeechAlignerConfig;
 
 type TrainBackend = Autodiff<NdArray<f32>>;
 type InferBackend = NdArray<f32>;
 
-fn main() {
+fn main() -> Result<()> {
     println!("burn-speech-training: quick-start example\n");
     println!("Training SpeechAligner on synthetic data (CPU)...\n");
 
@@ -40,9 +41,7 @@ fn main() {
         channels: [16, 32, 64, 128], // narrow channels (vs default 64-512)
         kernel_size: 3,
     };
-    let model = config
-        .init::<TrainBackend>(&device)
-        .expect("model init should succeed");
+    let model = config.init::<TrainBackend>(&device)?;
 
     let num_params = model.num_params();
     println!(
@@ -59,18 +58,21 @@ fn main() {
 
     // ── Synthetic training data ──────────────────────────────────────
     //
-    // Generate random MFCC-like features and CTC target sequences.
-    // In real training, these come from LibriSpeech audio + CMU Dict.
+    // Generate fixed MFCC-like input and CTC target sequences. Model
+    // initialization may still change the exact loss values across runs.
+    // In real training, the inputs come from LibriSpeech audio + CMU Dict.
     let batch_size = 2;
     let time_steps = 30; // ~0.3s of audio at 100 frames/sec
     let num_classes = config.num_classes as i32;
     let target_len = 6; // typical word has 4-8 phonemes
     let epochs = 5;
 
-    println!(
-        "Synthetic data: batch={}, time={}, targets={}/sample",
-        batch_size, time_steps, target_len
-    );
+    let feature_data = synthetic_features(batch_size, time_steps, config.input_dim, target_len);
+    let target_data = synthetic_targets(batch_size, target_len, num_classes);
+    let input_lengths_data = vec![time_steps as i32; batch_size];
+    let target_lengths_data = vec![target_len as i32; batch_size];
+
+    println!("Synthetic smoke test: fixed batch={batch_size}, time={time_steps}, targets={target_len}/sample");
     println!("Training for {} epochs...\n", epochs);
 
     // ── Training loop ────────────────────────────────────────────────
@@ -79,34 +81,25 @@ fn main() {
     for epoch in 0..epochs {
         let start = std::time::Instant::now();
 
-        // Generate a fresh random batch each epoch (simulates data variation)
-        let features: Tensor<TrainBackend, 3> = Tensor::random(
-            [batch_size, time_steps, config.input_dim],
-            Distribution::Normal(0.0, 1.0),
+        let features: Tensor<TrainBackend, 3> = Tensor::from_data(
+            TensorData::new(
+                feature_data.clone(),
+                Shape::new([batch_size, time_steps, config.input_dim]),
+            ),
             &device,
         );
 
-        // Random phoneme targets (1..num_classes, avoiding 0 = CTC blank)
-        let target_data: Vec<i32> = (0..batch_size * target_len)
-            .map(|i| (i as i32 % (num_classes - 1)) + 1)
-            .collect();
         let targets: Tensor<TrainBackend, 2, Int> = Tensor::from_data(
-            TensorData::new(target_data, Shape::new([batch_size, target_len])),
+            TensorData::new(target_data.clone(), Shape::new([batch_size, target_len])),
             &device,
         );
 
         let input_lengths: Tensor<TrainBackend, 1, Int> = Tensor::from_data(
-            TensorData::new(
-                vec![time_steps as i32; batch_size],
-                Shape::new([batch_size]),
-            ),
+            TensorData::new(input_lengths_data.clone(), Shape::new([batch_size])),
             &device,
         );
         let target_lengths: Tensor<TrainBackend, 1, Int> = Tensor::from_data(
-            TensorData::new(
-                vec![target_len as i32; batch_size],
-                Shape::new([batch_size]),
-            ),
+            TensorData::new(target_lengths_data.clone(), Shape::new([batch_size])),
             &device,
         );
 
@@ -122,10 +115,10 @@ fn main() {
             .mean()
             .into_data()
             .to_vec::<f32>()
-            .expect("loss extraction")
+            .map_err(|err| Error::training(format!("failed to extract loss: {err}")))?
             .into_iter()
             .next()
-            .expect("single loss value");
+            .ok_or_else(|| Error::training("loss tensor was empty"))?;
 
         // Backward pass + optimizer step
         let grads = loss.mean().backward();
@@ -146,9 +139,11 @@ fn main() {
     println!("\nRunning inference on the trained model...");
 
     let infer_model = model.valid();
-    let test_input: Tensor<InferBackend, 3> = Tensor::random(
-        [1, time_steps, config.input_dim],
-        Distribution::Normal(0.0, 1.0),
+    let test_input: Tensor<InferBackend, 3> = Tensor::from_data(
+        TensorData::new(
+            synthetic_features(1, time_steps, config.input_dim, target_len),
+            Shape::new([1, time_steps, config.input_dim]),
+        ),
         &device,
     );
 
@@ -161,9 +156,10 @@ fn main() {
     println!("  Boundary logits: {:?}", boundary_shape);
     println!("  CTC log-probs:   {:?}", ctc_shape);
 
-    println!("\nDone. The model trained on synthetic data — loss should decrease");
-    println!("over epochs. For real training, point to LibriSpeech data:");
+    println!("\nDone. This synthetic run checks that the training surface works.");
+    println!("For real training, point the library at LibriSpeech data:");
     println!("  See src/train.rs for the full data pipeline.");
+    Ok(())
 }
 
 fn format_params(n: usize) -> String {
@@ -174,4 +170,35 @@ fn format_params(n: usize) -> String {
     } else {
         format!("{n}")
     }
+}
+
+fn synthetic_features(
+    batch_size: usize,
+    time_steps: usize,
+    input_dim: usize,
+    target_len: usize,
+) -> Vec<f32> {
+    let mut values = Vec::with_capacity(batch_size * time_steps * input_dim);
+    for sample in 0..batch_size {
+        for frame in 0..time_steps {
+            let target_band = (frame * target_len / time_steps) as f32;
+            for dim in 0..input_dim {
+                let harmonic = ((frame + dim + sample) % 7) as f32 * 0.01;
+                let feature = target_band * 0.05 + dim as f32 * 0.005 + harmonic;
+                values.push(feature);
+            }
+        }
+    }
+    values
+}
+
+fn synthetic_targets(batch_size: usize, target_len: usize, num_classes: i32) -> Vec<i32> {
+    (0..batch_size)
+        .flat_map(|sample| {
+            (0..target_len).map(move |idx| {
+                let value = sample + idx + 1;
+                (value as i32 % (num_classes - 1)) + 1
+            })
+        })
+        .collect()
 }
