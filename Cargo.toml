@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.87"
 license = "MIT OR Apache-2.0"
-description = "End-to-end speech model training pipeline built on Burn — MFCC features, CTC loss, LibriSpeech loader, SpeechOcean762 evaluation"
+description = "Reference speech model training pipeline built on Burn — MFCC features, CTC loss, LibriSpeech loader, SpeechOcean762 evaluation"
 repository = "https://github.com/dnvt/burn-speech-training"
 keywords = ["burn", "speech", "ctc", "mfcc", "training"]
 categories = ["science", "multimedia::audio"]
@@ -16,7 +16,7 @@ cuda = ["burn/cuda", "burn/autodiff", "burn/std"]
 wgpu = ["burn/wgpu", "burn/autodiff", "burn/std"]
 
 [dependencies]
-burn = { version = "0.21.0-pre.2", default-features = false }
+burn = { version = "0.21.0", default-features = false }
 symphonia = { version = "0.5", features = ["all"] }
 realfft = "3.5"
 bitcode = { version = "0.6", features = ["serde"] }

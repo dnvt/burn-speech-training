@@ -29,6 +29,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --features ndarray
 
+  quickstart:
+    name: Quickstart Example
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --example train_small --features ndarray --release
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -49,3 +58,23 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --features ndarray --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package
