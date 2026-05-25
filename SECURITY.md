@@ -7,7 +7,7 @@ issues will be normal bugs, reproducibility problems, or documentation gaps.
 
 Security fixes target the current `main` branch and any published release.
 
-## Reporting A Security Issue
+## Reporting a Security Issue
 
 Do not attach private audio, private transcripts, model weights, API keys, or
 dataset credentials to public issues.

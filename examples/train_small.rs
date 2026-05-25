@@ -4,7 +4,7 @@
 //! targets. No external data files are needed.
 //!
 //! ```bash
-//! cargo run --example train_small --features ndarray
+//! cargo run --example train_small --features ndarray --release
 //! ```
 //!
 //! Expected output: finite loss values and valid inference output shapes.
