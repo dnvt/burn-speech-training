@@ -1,6 +1,6 @@
 [package]
 name = "burn-speech-training"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.92"
 license = "(MIT OR Apache-2.0) AND BSD-2-Clause"
@@ -8,6 +8,8 @@ description = "Speech model training on Burn: MFCC features, CTC training on Lib
 repository = "https://github.com/dnvt/burn-speech-training"
 keywords = ["burn", "speech", "ctc", "mfcc", "training"]
 categories = ["science", "multimedia::audio"]
+readme = "README.md"
+documentation = "https://docs.rs/burn-speech-training"
 include = [
     "/src",
     "/examples",
@@ -42,6 +44,9 @@ thiserror = "2"
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber = "0.3"
+
+[package.metadata.docs.rs]
+features = ["experiments"]
 
 [[bin]]
 name = "burn-speech"

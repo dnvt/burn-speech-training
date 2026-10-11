@@ -1,6 +1,8 @@
 # burn-speech-training
 
 [![CI](https://github.com/dnvt/burn-speech-training/actions/workflows/ci.yml/badge.svg)](https://github.com/dnvt/burn-speech-training/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/burn-speech-training)](https://crates.io/crates/burn-speech-training)
+[![docs.rs](https://img.shields.io/docsrs/burn-speech-training)](https://docs.rs/burn-speech-training)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](https://github.com/dnvt/burn-speech-training/blob/main/LICENSE)
 
 A complete speech training pipeline in Rust on [Burn](https://burn.dev):
@@ -46,7 +48,7 @@ Each box is a CLI command and a library function.
 ## Command line
 
 ```bash
-cargo install --path .          # or: cargo run --release -- <command> ...
+cargo install burn-speech-training   # or, from a clone: cargo run --release -- <command> ...
 
 # 1. (optional) cache features; training then skips audio decoding
 burn-speech precompute --data-dir ~/data/LibriSpeech --split train-clean-100 --out cache/
