@@ -7,7 +7,7 @@ present the model as production-ready.
 ## Model
 
 - Name: `SpeechAligner`
-- Framework: Burn 0.21
+- Framework: Burn 0.22
 - Default shape: 4 Conv1d + squeeze-and-excitation blocks, one self-attention
   layer, CTC head; see the README for the full layer list
 - Default size: 1,709,837 parameters

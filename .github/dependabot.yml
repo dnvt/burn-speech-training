@@ -9,5 +9,5 @@ updates:
     schedule:
       interval: monthly
     ignore:
-      # The `@1.92` ref pins the minimum supported Rust version on purpose.
+      # The `@1.95` ref pins the minimum supported Rust version on purpose.
       - dependency-name: dtolnay/rust-toolchain

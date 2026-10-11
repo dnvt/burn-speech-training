@@ -7,8 +7,7 @@ mod layers;
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::log_softmax;
-use burn::tensor::backend::Backend;
-use burn::tensor::{Bool, Tensor};
+use burn::tensor::{Bool, Device, Tensor};
 use serde::{Deserialize, Serialize};
 
 use self::layers::{ConvSEBlock, SelfAttentionLayer};
@@ -60,7 +59,7 @@ impl SpeechAlignerConfig {
     }
 
     /// Initialise a model with random weights on `device`.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> Result<SpeechAligner<B>> {
+    pub fn init(&self, device: &Device) -> Result<SpeechAligner> {
         let d_model = self.channels[3];
         if self.n_heads == 0 || !d_model.is_multiple_of(self.n_heads) {
             return Err(Error::config(format!(
@@ -97,17 +96,17 @@ impl SpeechAlignerConfig {
 ///
 /// Values at padded frames are unspecified and must be masked by the consumer.
 #[derive(Debug)]
-pub struct SpeechAlignerOutput<B: Backend> {
+pub struct SpeechAlignerOutput {
     /// Encoder output after self-attention: `[batch, time, channels[3]]`.
-    pub frame_features: Tensor<B, 3>,
+    pub frame_features: Tensor<3>,
     /// Phoneme logits: `[batch, time, num_classes]`.
-    pub phoneme_logits: Tensor<B, 3>,
+    pub phoneme_logits: Tensor<3>,
     /// Boundary logits (pre-sigmoid): `[batch, time, 1]`.
-    pub boundary_logits: Tensor<B, 3>,
+    pub boundary_logits: Tensor<3>,
     /// CTC log-probabilities: `[time, batch, num_classes]`.
-    pub ctc_log_probs: Tensor<B, 3>,
+    pub ctc_log_probs: Tensor<3>,
     /// CTC logits (pre-softmax): `[time, batch, num_classes]`.
-    pub ctc_logits: Tensor<B, 3>,
+    pub ctc_logits: Tensor<3>,
 }
 
 /// Speech encoder with phoneme, boundary and CTC heads.
@@ -118,20 +117,20 @@ pub struct SpeechAlignerOutput<B: Backend> {
 /// applied per frame. There is no positional encoding; frame order is only
 /// seen by the convolutions.
 #[derive(Module, Debug)]
-pub struct SpeechAligner<B: Backend> {
-    conv1: ConvSEBlock<B>,
-    conv2: ConvSEBlock<B>,
-    conv3: ConvSEBlock<B>,
-    conv4: ConvSEBlock<B>,
-    attention: SelfAttentionLayer<B>,
-    phoneme_head: Linear<B>,
-    boundary_head: Linear<B>,
-    ctc_head: Linear<B>,
+pub struct SpeechAligner {
+    conv1: ConvSEBlock,
+    conv2: ConvSEBlock,
+    conv3: ConvSEBlock,
+    conv4: ConvSEBlock,
+    attention: SelfAttentionLayer,
+    phoneme_head: Linear,
+    boundary_head: Linear,
+    ctc_head: Linear,
 }
 
-impl<B: Backend> SpeechAligner<B> {
+impl SpeechAligner {
     /// Run the model on a batch in which every frame is real.
-    pub fn forward(&self, x: Tensor<B, 3>) -> SpeechAlignerOutput<B> {
+    pub fn forward(&self, x: Tensor<3>) -> SpeechAlignerOutput {
         self.forward_masked(x, None)
     }
 
@@ -142,17 +141,17 @@ impl<B: Backend> SpeechAligner<B> {
     /// frames do not depend on how much padding a batch contains.
     pub fn forward_with_pad_mask(
         &self,
-        x: Tensor<B, 3>,
-        mask_pad: Tensor<B, 2, Bool>,
-    ) -> SpeechAlignerOutput<B> {
+        x: Tensor<3>,
+        mask_pad: Tensor<2, Bool>,
+    ) -> SpeechAlignerOutput {
         self.forward_masked(x, Some(mask_pad))
     }
 
     fn forward_masked(
         &self,
-        x: Tensor<B, 3>,
-        mask_pad: Option<Tensor<B, 2, Bool>>,
-    ) -> SpeechAlignerOutput<B> {
+        x: Tensor<3>,
+        mask_pad: Option<Tensor<2, Bool>>,
+    ) -> SpeechAlignerOutput {
         let keep = mask_pad
             .clone()
             .map(|mask| mask.bool_not().float().unsqueeze_dim::<3>(1));
@@ -211,13 +210,9 @@ pub fn proportional_word_frame_span(
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::ndarray::NdArrayDevice;
-    use burn::backend::NdArray;
     use burn::tensor::{Distribution, Int, Tensor, Tolerance};
 
     use super::*;
-
-    type B = NdArray<f32>;
 
     /// README "Tiny" widths: debug-build convolutions at the default widths
     /// take tens of seconds per forward pass.
@@ -229,21 +224,21 @@ mod tests {
         }
     }
 
-    fn init_model(config: &SpeechAlignerConfig) -> SpeechAligner<B> {
+    fn init_model(config: &SpeechAlignerConfig) -> SpeechAligner {
         config
-            .init(&NdArrayDevice::default())
+            .init(&Device::default())
             .expect("SpeechAligner init should succeed")
     }
 
-    fn random_input(batch: usize, time: usize, dim: usize) -> Tensor<B, 3> {
-        let device = NdArrayDevice::default();
+    fn random_input(batch: usize, time: usize, dim: usize) -> Tensor<3> {
+        let device = Device::default();
         Tensor::random([batch, time, dim], Distribution::Normal(0.0, 1.0), &device)
     }
 
     /// Pad mask `[lengths.len(), max_time]` that is `true` past each length.
-    fn pad_mask(lengths: &[usize], max_time: usize) -> Tensor<B, 2, Bool> {
-        let device = NdArrayDevice::default();
-        let mut mask = Tensor::<B, 2, Int>::zeros([lengths.len(), max_time], &device);
+    fn pad_mask(lengths: &[usize], max_time: usize) -> Tensor<2, Bool> {
+        let device = Device::default();
+        let mut mask = Tensor::<2, Int>::zeros([lengths.len(), max_time], &device);
         for (row, &len) in lengths.iter().enumerate() {
             if len < max_time {
                 mask = mask.slice_assign(
@@ -255,7 +250,7 @@ mod tests {
         mask.equal_elem(1)
     }
 
-    fn assert_close(actual: Tensor<B, 3>, expected: Tensor<B, 3>, tolerance: f32) {
+    fn assert_close(actual: Tensor<3>, expected: Tensor<3>, tolerance: f32) {
         actual
             .to_data()
             .assert_approx_eq::<f32>(&expected.to_data(), Tolerance::absolute(tolerance));
@@ -283,13 +278,13 @@ mod tests {
         let output = model.forward(random_input(1, 20, 39));
 
         let total_prob = output.ctc_log_probs.exp().sum_dim(2);
-        let expected = Tensor::ones([20, 1, 1], &NdArrayDevice::default());
+        let expected = Tensor::ones([20, 1, 1], &Device::default());
         assert_close(total_prob, expected, 1e-4);
     }
 
     #[test]
     fn padding_does_not_change_outputs_on_real_frames() {
-        let device = NdArrayDevice::default();
+        let device = Device::default();
         let model = init_model(&tiny_config());
         let [short_len, long_len, dim] = [20, 32, 39];
 
@@ -307,7 +302,7 @@ mod tests {
         let batched =
             model.forward_with_pad_mask(batch, pad_mask(&[short_len, long_len], long_len));
 
-        let real = |t: Tensor<B, 3>| t.slice([0..1, 0..short_len]);
+        let real = |t: Tensor<3>| t.slice([0..1, 0..short_len]);
         assert_close(real(batched.frame_features), alone.frame_features, 1e-4);
         assert_close(real(batched.phoneme_logits), alone.phoneme_logits, 1e-4);
         assert_close(real(batched.boundary_logits), alone.boundary_logits, 1e-4);
@@ -357,7 +352,7 @@ mod tests {
                 n_heads,
                 ..SpeechAlignerConfig::default()
             };
-            let result = config.init::<B>(&NdArrayDevice::default());
+            let result = config.init(&Device::default());
             assert!(
                 matches!(result, Err(Error::Config(_))),
                 "n_heads = {n_heads}"

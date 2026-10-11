@@ -2,7 +2,7 @@
 name = "burn-speech-training"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.92"
+rust-version = "1.95"
 license = "(MIT OR Apache-2.0) AND BSD-2-Clause"
 description = "Speech model training on Burn: MFCC features, CTC training on LibriSpeech, pronunciation scoring on SpeechOcean762"
 repository = "https://github.com/dnvt/burn-speech-training"
@@ -19,10 +19,12 @@ include = [
 ]
 
 [features]
-default = ["ndarray", "cli"]
-ndarray = ["burn/ndarray", "burn/autodiff", "burn/std"]
-cuda = ["burn/cuda", "burn/autodiff", "burn/std"]
-wgpu = ["burn/wgpu", "burn/autodiff", "burn/std"]
+default = ["flex", "cli"]
+# Backends. Several can be enabled; the default device is the first available
+# of cuda, wgpu, flex (override with the BURN_DEVICE environment variable).
+flex = ["burn/flex"]
+cuda = ["burn/cuda"]
+wgpu = ["burn/wgpu"]
 # Loss functions, schedules and inputs from the experiment log that did not
 # beat the baseline recipe. See src/experiments/.
 experiments = []
@@ -30,7 +32,7 @@ experiments = []
 cli = ["dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
-burn = { version = "0.21.0", default-features = false }
+burn = { version = "0.22.0", default-features = false, features = ["std", "optim"] }
 symphonia = { version = "0.6", default-features = false, features = ["flac", "pcm", "wav"] }
 realfft = "3.5"
 serde = { version = "1", features = ["derive"] }
