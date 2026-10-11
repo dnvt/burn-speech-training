@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-10-11
 
 Burn 0.22. Checkpoints use a new file format, so models trained with 0.2.0
 must be retrained.
