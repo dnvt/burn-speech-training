@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-10-11
 
 The crate was reorganised around a smaller API. Breaking changes throughout.
 
@@ -30,6 +30,13 @@ The crate was reorganised around a smaller API. Breaking changes throughout.
 - A fresh run in an existing checkpoint directory no longer inherits epoch
   numbers from old files.
 - Precompute wrote one syscall per float.
+- Loading a checkpoint into a different architecture succeeded and then
+  panicked on first use; it is now an error. A never-used module saved
+  different weights than it used.
+- Resuming into a new output directory, or with a mismatched model, lost
+  or overwrote the earlier run's state.
+- Feature-mode and scoring-head width mismatches return errors instead of
+  panicking.
 - `Phoneme::AH` was mapped to /ɑ/ (ARPABET AA); the IPA layer is gone.
 
 ### Changed
