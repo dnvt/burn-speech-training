@@ -29,30 +29,14 @@ pub struct CmuDict {
 }
 
 impl CmuDict {
-    /// Load and parse the embedded `CMUdict`.
+    /// Decode the dictionary that `build.rs` embedded in the binary.
     ///
-    /// # Returns
-    ///
-    /// `Ok(CmuDict)` with parsed dictionary, or `Err` if parsing fails.
-    ///
-    /// # Performance
-    ///
-    /// First load parses ~126K unique entries (~50-100ms).
-    /// Consider caching the instance for repeated lookups.
+    /// Decoding takes on the order of 10 ms; keep the instance around
+    /// instead of reloading it per lookup.
     ///
     /// # Errors
     ///
-    /// Returns error if dictionary data is corrupted (should not happen
-    /// with embedded data).
-    /// Load and deserialize the pre-computed `CMUdict`.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(CmuDict)` with parsed dictionary, or `Err` if deserialization fails.
-    ///
-    /// # Performance
-    ///
-    /// Fast binary deserialization (~10ms vs ~100ms parsing).
+    /// Returns an error if the embedded data cannot be decoded.
     pub fn load() -> Result<Self, CmuDictError> {
         let data = include_bytes!(concat!(env!("OUT_DIR"), "/cmudict.bin"));
         let entries: HashMap<String, Vec<Phoneme>> =
@@ -61,9 +45,7 @@ impl CmuDict {
         Ok(Self { entries })
     }
 
-    /// Get the phoneme sequence for a word.
-    ///
-    /// Alias for `lookup()` with more intuitive name.
+    /// Borrow the phoneme sequence for a word, without cloning.
     #[must_use]
     pub fn get(&self, word: &str) -> Option<&[Phoneme]> {
         self.entries.get(&word.to_lowercase()).map(Vec::as_slice)

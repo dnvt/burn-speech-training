@@ -19,31 +19,18 @@ use crate::finetune::{
 use crate::mfcc::{FeatureMode, MfccExtractor};
 use crate::model::{proportional_word_frame_span, SpeechAligner, SpeechAlignerConfig};
 use crate::phoneme_map::arpabet_to_idx;
-use crate::ui::{detail, section, step, success};
-
-const START_GATE: f64 = 0.30;
-const SUCCESS_GATE: f64 = 0.40;
-
-// ── SpeechOcean762 JSON schema ──────────────────────────────────────
+use crate::ui::{detail, section, step};
 
 #[derive(Deserialize)]
 struct WordDataset {
-    #[allow(dead_code)]
-    metadata: serde_json::Value,
     samples: Vec<WordSample>,
 }
 
 #[derive(Deserialize)]
 struct WordSample {
-    #[allow(dead_code)]
-    word_id: String,
-    #[allow(dead_code)]
-    text: String,
     human_score: f64,
     audio_file: String,
     phonemes: Vec<String>,
-    #[allow(dead_code)]
-    utterance_id: String,
     word_position: usize,
     sentence_text: String,
 }
@@ -126,7 +113,6 @@ pub fn execute_evaluate(args: &EvaluateArgs) -> Result<()> {
         .map(|cache_dir| load_teacher_feature_cache(cache_dir))
         .transpose()?;
 
-    // ── 1. Load checkpoint ──────────────────────────────────────
     step("Loading checkpoint");
     let mut scoring_config = ScoringHeadConfig::default();
     if let Some(path) = args.scoring_head.as_ref() {
@@ -150,7 +136,7 @@ pub fn execute_evaluate(args: &EvaluateArgs) -> Result<()> {
         && teacher_feature_cache.is_none()
     {
         return Err(Error::config(
-            "Scoring head requires --distillation-features to replay cached teacher inputs",
+            "Scoring head requires `distillation_features` to replay cached teacher inputs",
         ));
     }
 
@@ -178,7 +164,6 @@ pub fn execute_evaluate(args: &EvaluateArgs) -> Result<()> {
         None => (None, ScoringHeadConfig::default()),
     };
 
-    // ── 2. Load dataset ─────────────────────────────────────────
     step("Loading SpeechOcean762 holdout");
     let raw = std::fs::read_to_string(&args.dataset)
         .map_err(|e| Error::config(format!("Cannot read dataset: {e}")))?;
@@ -194,7 +179,6 @@ pub fn execute_evaluate(args: &EvaluateArgs) -> Result<()> {
         dataset.samples.len()
     ));
 
-    // ── 3. Group by utterance (avoid re-loading same audio) ─────
     step("Grouping samples by utterance");
     let mut utterance_groups: std::collections::BTreeMap<String, Vec<&WordSample>> =
         std::collections::BTreeMap::new();
@@ -206,7 +190,6 @@ pub fn execute_evaluate(args: &EvaluateArgs) -> Result<()> {
     }
     detail(&format!("  Unique utterances: {}", utterance_groups.len()));
 
-    // ── 4. Run inference + compute per-word scores ───────────────
     let inference_label = if scoring_head.is_some() {
         "Running inference (GOP variants + SO762 scoring head)"
     } else {
@@ -411,7 +394,7 @@ pub fn execute_evaluate(args: &EvaluateArgs) -> Result<()> {
         == 0
     {
         return Err(Error::config(
-            "Teacher-cache scoring head produced 0 words. Ensure --distillation-features \
+            "Teacher-cache scoring head produced 0 words. Ensure `distillation_features` \
              contains the evaluation split, not only the training set.",
         ));
     }
@@ -422,7 +405,6 @@ pub fn execute_evaluate(args: &EvaluateArgs) -> Result<()> {
         )));
     }
 
-    // ── 5. Compute Spearman correlation across all active methods ──
     let correlation_label = if scoring_head_metric.is_some() {
         "Computing Spearman correlation (4 GOP methods + scoring head)"
     } else {
@@ -446,7 +428,6 @@ pub fn execute_evaluate(args: &EvaluateArgs) -> Result<()> {
         .max_by(|a, b| a.rho.total_cmp(&b.rho))
         .ok_or_else(|| Error::process("No evaluation metrics were produced"))?;
 
-    #[allow(clippy::cast_precision_loss)]
     let human_mean = scored_any_humans.iter().sum::<f64>() / processed as f64;
 
     let result_label = if scoring_head.is_some() {
@@ -477,28 +458,9 @@ pub fn execute_evaluate(args: &EvaluateArgs) -> Result<()> {
         best_metric.name, best_metric.rho, best_metric.pcc
     ));
 
-    if best_metric.rho >= SUCCESS_GATE {
-        success(&format!(
-            "FULL SUCCESS: ρ = {:.4} ≥ {:.2} — Path A full success gate met",
-            best_metric.rho, SUCCESS_GATE
-        ));
-    } else if best_metric.rho >= START_GATE {
-        success(&format!(
-            "START GATE PASS: ρ = {:.4} ≥ {:.2} — start gate cleared, but {:.2} \
-             full-success gate remains unmet",
-            best_metric.rho, START_GATE, SUCCESS_GATE
-        ));
-    } else {
-        detail(&format!(
-            "  GATE FAIL: ρ = {:.4} < {:.2} — start gate not met",
-            best_metric.rho, START_GATE
-        ));
-    }
-
     let (gop_mean, gop_min, gop_max) = if logprob_metric.predicted.is_empty() {
         (0.0, 0.0, 0.0)
     } else {
-        #[allow(clippy::cast_precision_loss)]
         let gop_mean =
             logprob_metric.predicted.iter().sum::<f64>() / logprob_metric.predicted.len() as f64;
         let gop_min = logprob_metric
@@ -536,8 +498,6 @@ pub fn execute_evaluate(args: &EvaluateArgs) -> Result<()> {
 
     Ok(())
 }
-
-// ── Checkpoint loading ──────────────────────────────────────────
 
 fn load_checkpoint<B: Backend>(
     path: &Path,
@@ -587,80 +547,11 @@ fn compute_word_scoring_head<B: Backend>(
         .map(f64::from)
 }
 
-// ── GOP computation from CTC log-probs ──────────────────────────
-
-/// Compute a word-level GOP score from CTC log-probabilities.
-///
-/// Strategy: divide frames proportionally among words in the sentence,
-/// then for each target phoneme, find the max log-prob for that phoneme
-/// class across the word's frame span. Average the per-phoneme scores.
-#[allow(dead_code)] // Replaced by compute_word_gop_all but kept as reference
-fn compute_word_gop<B: Backend>(
-    log_probs: &Tensor<B, 2>, // [time, num_classes]
-    num_frames: usize,
-    phonemes: &[String],
-    sentence_text: &str,
-    word_position: usize,
-) -> Option<f64> {
-    if phonemes.is_empty() {
-        return None;
-    }
-
-    // Map phonemes to class indices
-    let indices: Vec<i32> = phonemes.iter().filter_map(|p| arpabet_to_idx(p)).collect();
-
-    if indices.is_empty() {
-        return None;
-    }
-
-    let num_words = sentence_text.split_whitespace().count();
-    let (start_frame, end_frame) =
-        proportional_word_frame_span(num_frames, num_words, word_position)?;
-
-    // Extract log-probs for this word's frame span (42 = phonemes + CTC blank)
-    let num_classes = 42;
-    let word_log_probs = log_probs
-        .clone()
-        .slice([start_frame..end_frame, 0..num_classes]);
-    let word_data: Vec<f32> = word_log_probs.into_data().to_vec().ok()?;
-    let word_frames = end_frame - start_frame;
-
-    // For each target phoneme, find the max log-prob across frames
-    let mut phoneme_gops: Vec<f64> = Vec::with_capacity(indices.len());
-    for &class_idx in &indices {
-        if class_idx < 0 || class_idx as usize >= num_classes {
-            continue;
-        }
-        let col = class_idx as usize;
-        let mut max_log_prob = f64::NEG_INFINITY;
-        for frame in 0..word_frames {
-            let val = word_data
-                .get(frame * num_classes + col)
-                .copied()
-                .unwrap_or(f32::NEG_INFINITY);
-            let val_f64 = f64::from(val);
-            if val_f64 > max_log_prob {
-                max_log_prob = val_f64;
-            }
-        }
-        phoneme_gops.push(max_log_prob);
-    }
-
-    if phoneme_gops.is_empty() {
-        return None;
-    }
-
-    // Average per-phoneme GOP (in log-prob space, higher = better)
-    let avg = phoneme_gops.iter().sum::<f64>() / phoneme_gops.len() as f64;
-    Some(avg)
-}
-
 /// Compute all 3 GOP variants for a word: `(log-prob, max-logit, margin)`.
 ///
 /// - `GOPLogProb`: max log-softmax probability per target phoneme
 /// - `GOPMaxLogit`: max raw logit per target phoneme (Parikh et al.)
 /// - `GOPMargin`: gap between target phoneme logit and next-highest logit
-#[allow(clippy::too_many_arguments)]
 fn compute_word_gop_all<B: Backend>(
     log_probs: &Tensor<B, 2>,  // [time, num_classes] — post log-softmax
     raw_logits: &Tensor<B, 2>, // [time, num_classes] — pre-softmax
@@ -760,16 +651,12 @@ fn compute_word_gop_all<B: Backend>(
         return None;
     }
 
-    #[allow(clippy::cast_precision_loss)]
     let n = count as f64;
     Some((sum_logprob / n, sum_max_logit / n, sum_margin / n))
 }
 
-// ── GOP-SA (Self-Aligned) via CTC best-path ──────────────────────
-
 /// CTC best-path decoding: argmax at each frame, collapse repeats + blanks.
 /// Returns a `Vec` of `(class_index, start_frame, end_frame)` segments.
-#[allow(clippy::indexing_slicing)]
 fn ctc_best_path(
     log_probs: &[f32], // flat [time × num_classes]
     num_frames: usize,
@@ -819,7 +706,6 @@ fn ctc_best_path(
 /// For each target phoneme in the word, find the best-path segment that
 /// matches it, then score as the average log-prob at those frames.
 /// If a target phoneme has no matching segment, it gets a deletion penalty.
-#[allow(clippy::indexing_slicing, clippy::too_many_arguments)]
 fn compute_word_gop_sa(
     log_probs: &[f32],                   // flat [time × num_classes]
     best_path: &[(usize, usize, usize)], // (class, start, end)
@@ -886,13 +772,9 @@ fn compute_word_gop_sa(
         return None;
     }
 
-    #[allow(clippy::cast_precision_loss)]
     Some(total_score / count as f64)
 }
 
-// ── Spearman correlation ────────────────────────────────────────
-
-#[allow(clippy::similar_names, clippy::indexing_slicing)]
 pub fn spearman_rho(x: &[f64], y: &[f64]) -> f64 {
     let n = x.len();
     if n < 2 || x.len() != y.len() {
@@ -927,16 +809,13 @@ pub fn spearman_rho(x: &[f64], y: &[f64]) -> f64 {
 /// Pearson correlation coefficient (PCC) on raw values.
 ///
 /// The standard metric for `SpeechOcean762` comparisons in the literature.
-#[allow(clippy::similar_names)]
 pub fn pearson_r(x: &[f64], y: &[f64]) -> f64 {
     let n = x.len();
     if n < 2 || x.len() != y.len() {
         return 0.0;
     }
 
-    #[allow(clippy::cast_precision_loss)]
     let avg_x = x.iter().sum::<f64>() / n as f64;
-    #[allow(clippy::cast_precision_loss)]
     let avg_y = y.iter().sum::<f64>() / n as f64;
 
     let mut cov = 0.0;
@@ -957,7 +836,6 @@ pub fn pearson_r(x: &[f64], y: &[f64]) -> f64 {
     cov / denom
 }
 
-#[allow(clippy::indexing_slicing)]
 fn ranks(values: &[f64]) -> Vec<f64> {
     let n = values.len();
     let mut indexed: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
@@ -980,7 +858,6 @@ fn ranks(values: &[f64]) -> Vec<f64> {
     result
 }
 
-#[allow(clippy::indexing_slicing)]
 pub fn bootstrap_ci_95(x: &[f64], y: &[f64], n_boot: usize) -> (f64, f64) {
     let n = x.len();
     if n < 10 {
@@ -1015,9 +892,7 @@ pub fn bootstrap_ci_95(x: &[f64], y: &[f64], n_boot: usize) -> (f64, f64) {
     (rhos[lo_idx], rhos[hi_idx])
 }
 
-// ── Report formatting ───────────────────────────────────────────
-
-#[allow(clippy::similar_names, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn format_report_multi(
     checkpoint: &Path,
     scoring_head: Option<&Path>,
@@ -1090,31 +965,6 @@ fn format_report_multi(
         "\n**Best method**: {} (ρ={:.4}, PCC={:.4})",
         best_metric.name, best_metric.rho, best_metric.pcc
     );
-    r.push_str("\n## Gate Decision\n\n");
-    if best_metric.rho >= SUCCESS_GATE {
-        let _ = writeln!(
-            r,
-            "**FULL SUCCESS** — ρ = {:.4} ≥ {:.2}. Path A full-success gate met.",
-            best_metric.rho, SUCCESS_GATE
-        );
-    } else if best_metric.rho >= START_GATE {
-        let _ = writeln!(
-            r,
-            "**START GATE PASS** — ρ = {:.4} ≥ {:.2}, so start gate cleared. Full-success \
-             gate {:.2} remains unmet.",
-            best_metric.rho, START_GATE, SUCCESS_GATE
-        );
-    } else {
-        let _ = writeln!(
-            r,
-            "**FAIL** — best ρ = {:.4} < {:.2}, so start gate not met.",
-            best_metric.rho, START_GATE
-        );
-        r.push_str("\nNext steps:\n");
-        r.push_str("1. Validate richer feature paths (for example logmel80 or teacher features)\n");
-        r.push_str("2. Fine-tune scoring head on SpeechOcean762 with inline holdout tracking\n");
-        r.push_str("3. Re-evaluate before proceeding to large-scale training\n");
-    }
     r
 }
 

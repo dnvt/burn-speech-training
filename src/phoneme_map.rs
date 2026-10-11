@@ -36,16 +36,11 @@ const ARPABET_INVENTORY: [&str; 40] = [
 #[must_use]
 pub fn arpabet_to_idx(symbol: &str) -> Option<i32> {
     let (base, _stress) = parse_arpabet_stress(symbol);
-    ARPABET_INVENTORY.binary_search(&base).ok().map(|idx| {
-        #[allow(clippy::cast_possible_wrap)]
-        let result = (idx as i32) + 1;
-        result
-    })
+    ARPABET_INVENTORY
+        .binary_search(&base)
+        .ok()
+        .map(|idx| idx as i32 + 1)
 }
-
-// ---------------------------------------------------------------------------
-// Resolution metrics
-// ---------------------------------------------------------------------------
 
 /// How a word was resolved to phoneme indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +80,6 @@ pub struct ResolutionStats {
 impl ResolutionStats {
     /// Percentage of words resolved by dictionary (best quality).
     #[must_use]
-    #[allow(dead_code)] // Public API for training metrics reporting
     pub fn dict_rate(&self) -> f64 {
         if self.total_words == 0 {
             return 0.0;
@@ -93,10 +87,6 @@ impl ResolutionStats {
         self.dict_hits as f64 / self.total_words as f64
     }
 }
-
-// ---------------------------------------------------------------------------
-// Main entry point
-// ---------------------------------------------------------------------------
 
 /// Convert a transcript sentence to CTC target indices via `CMUdict` with
 /// a 8-stage fallback chain for OOV reduction.
@@ -161,10 +151,6 @@ pub fn transcript_to_targets(text: &str, dict: &CmuDict) -> Result<(Vec<i32>, Re
     Ok((targets, stats))
 }
 
-// ---------------------------------------------------------------------------
-// Fallback chain
-// ---------------------------------------------------------------------------
-
 /// Try resolving a word through the 8-stage fallback chain.
 /// Always returns at least an approximate result via rule-based G2P.
 fn resolve_word(word: &str, dict: &CmuDict) -> (Vec<i32>, ResolutionMethod) {
@@ -222,9 +208,7 @@ fn dict_lookup_to_indices(word: &str, dict: &CmuDict) -> Option<Vec<i32>> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Stage 2: Possessive decomposition (2X1.1)
-// ---------------------------------------------------------------------------
+// Stage 2: Possessive decomposition
 
 /// Possessive/contraction suffixes and their ARPABET phoneme(s).
 const POSSESSIVE_SUFFIXES: &[(&str, &[&str])] = &[
@@ -258,9 +242,7 @@ fn try_possessive(word: &str, dict: &CmuDict) -> Option<Vec<i32>> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// Stage 3: Hyphen/compound splitting (2X1.2)
-// ---------------------------------------------------------------------------
+// Stage 3: Hyphen/compound splitting
 
 /// Try splitting on hyphens and looking up each part.
 fn try_hyphen_split(word: &str, dict: &CmuDict) -> Option<Vec<i32>> {
@@ -284,9 +266,7 @@ fn try_hyphen_split(word: &str, dict: &CmuDict) -> Option<Vec<i32>> {
     Some(all_indices)
 }
 
-// ---------------------------------------------------------------------------
-// Stage 4: Suffix/prefix stripping (2X1.3)
-// ---------------------------------------------------------------------------
+// Stage 4: Suffix/prefix stripping
 
 /// Suffix rules: `(suffix_to_strip, ARPABET phonemes to append)`.
 /// Ordered longest-first to avoid partial matches.
@@ -392,9 +372,7 @@ fn try_suffix_strip(word: &str, dict: &CmuDict) -> Option<Vec<i32>> {
     None
 }
 
-// ---------------------------------------------------------------------------
 // Stage 5: Compound splitting without hyphens
-// ---------------------------------------------------------------------------
 
 /// Try splitting a word at every position and check if both halves are in
 /// `CMUdict`. Example: `SHIPMASTERS` → `SHIP` + `MASTERS`.
@@ -423,9 +401,7 @@ fn try_compound_split(word: &str, dict: &CmuDict) -> Option<Vec<i32>> {
     None
 }
 
-// ---------------------------------------------------------------------------
 // Stage 6: Chained prefix + suffix stripping
-// ---------------------------------------------------------------------------
 
 /// Try stripping both a prefix AND a suffix simultaneously.
 /// Example: `UNTIDINESS` → `UN` + `TIDY` + `NESS`.
@@ -480,9 +456,7 @@ fn try_chained_affix(word: &str, dict: &CmuDict) -> Option<Vec<i32>> {
     None
 }
 
-// ---------------------------------------------------------------------------
 // Stage 7: Possessive of unknown base (G2P base + possessive phoneme)
-// ---------------------------------------------------------------------------
 
 /// If a word ends with `'S` and the base isn't in `CMUdict`, apply G2P to the
 /// base and append the possessive phoneme. Example: `JELLYBY'S` → G2P(JELLYBY)
@@ -503,9 +477,7 @@ fn try_possessive_g2p(word: &str) -> Option<Vec<i32>> {
     Some(indices)
 }
 
-// ---------------------------------------------------------------------------
-// Stage 8: Rule-based G2P fallback (2X1.4)
-// ---------------------------------------------------------------------------
+// Stage 8: Rule-based G2P fallback
 
 /// Rule-based letter-to-phoneme conversion for unknown words.
 ///
@@ -620,10 +592,6 @@ fn single_char_to_arpabet(ch: char) -> Option<&'static str> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// IPA → ARPABET reverse mapping
-// ---------------------------------------------------------------------------
-
 /// Map an IPA symbol (from `Phoneme::ipa_symbol()`) back to an ARPABET CTC
 /// index.
 #[must_use]
@@ -674,12 +642,7 @@ fn ipa_to_arpabet_idx(ipa: &str) -> Option<i32> {
     arpabet_to_idx(arpabet)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
-#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -742,7 +705,7 @@ mod tests {
         assert!(transcript_to_targets("", &dict).is_err());
     }
 
-    // --- Possessive decomposition (2X1.1) ---
+    // --- Possessive decomposition ---
 
     #[test]
     fn test_possessive_s() {
@@ -809,7 +772,7 @@ mod tests {
         assert!(result.is_none(), "unknown base should not resolve");
     }
 
-    // --- Hyphen splitting (2X1.2) ---
+    // --- Hyphen splitting ---
 
     #[test]
     fn test_hyphen_split_both_known() {
@@ -833,7 +796,7 @@ mod tests {
         assert!(try_hyphen_split("HELLO", &dict).is_none());
     }
 
-    // --- Suffix stripping (2X1.3) ---
+    // --- Suffix stripping ---
 
     #[test]
     fn test_suffix_ly() {
@@ -969,7 +932,7 @@ mod tests {
         assert!(try_possessive_g2p("HELLO").is_none());
     }
 
-    // --- Rule-based G2P (2X1.4) ---
+    // --- Rule-based G2P ---
 
     #[test]
     fn test_g2p_produces_output() {

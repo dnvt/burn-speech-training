@@ -154,7 +154,6 @@ pub fn execute_precompute(args: &PrecomputeArgs) -> Result<()> {
         .map_err(|e| Error::process(format!("Failed to write manifest: {e}")))?;
 
     // 6. Summary
-    #[allow(clippy::cast_precision_loss)]
     let size_mb = estimate_cache_size(&manifest) as f64 / (1024.0 * 1024.0);
 
     success(&format!(
@@ -174,7 +173,6 @@ pub fn execute_precompute(args: &PrecomputeArgs) -> Result<()> {
 
 /// Load precomputed samples from a cache directory.
 /// Called by the precomputed training loop.
-#[allow(dead_code)]
 pub fn load_precomputed(
     cache_dir: &Path,
 ) -> Result<(PrecomputedManifest, Vec<super::dataset::TrainingSample>)> {
@@ -210,8 +208,6 @@ pub fn load_precomputed(
 
     Ok((manifest, samples))
 }
-
-// ── Internal helpers ────────────────────────────────────────────────
 
 fn extract_and_save(
     index: usize,
@@ -296,7 +292,6 @@ fn write_binary_sample(
         .map_err(|e| Error::process(format!("Cannot write {}: {e}", path.display())))
 }
 
-#[allow(dead_code)]
 fn load_binary_sample(
     path: &Path,
     expected_frames: usize,

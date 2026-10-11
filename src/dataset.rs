@@ -4,8 +4,6 @@
 //! on-the-fly, resolves phoneme targets via `CMUdict`, and produces
 //! length-sorted, padded training batches.
 
-#![allow(clippy::indexing_slicing)] // Bounded by construction in batch assembly
-
 use std::path::{Path, PathBuf};
 
 use crate::g2p::CmuDict;
@@ -195,7 +193,6 @@ pub fn load_audio_samples(path: &Path) -> Result<Vec<f32>> {
             // Downmix to mono by averaging channels
             for chunk in sample_buf.samples().chunks(num_channels) {
                 let sum: f32 = chunk.iter().sum();
-                #[allow(clippy::cast_precision_loss)]
                 let avg = sum / num_channels as f32;
                 all_samples.push(avg);
             }
@@ -303,7 +300,6 @@ pub fn create_batches<B: burn::tensor::backend::Backend>(
             let t_offset = i * max_target;
             target_data[t_offset..t_offset + l].copy_from_slice(&sample.targets);
 
-            #[allow(clippy::cast_possible_wrap)]
             {
                 input_lens.push(t as i32);
                 target_lens.push(l as i32);
@@ -428,7 +424,6 @@ pub fn create_dynamic_batches<B: burn::tensor::backend::Backend>(
             let t_offset = i * max_target;
             target_data[t_offset..t_offset + l].copy_from_slice(&sample.targets);
 
-            #[allow(clippy::cast_possible_wrap)]
             {
                 input_lens.push(t as i32);
                 target_lens.push(l as i32);
@@ -554,7 +549,6 @@ fn estimate_audio_duration(path: &Path) -> f32 {
     let bytes = metadata.len();
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    #[allow(clippy::cast_precision_loss)]
     match ext {
         "flac" => bytes as f32 / 4000.0,
         "wav" => bytes as f32 / 32000.0,

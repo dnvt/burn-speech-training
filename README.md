@@ -23,24 +23,18 @@ cd burn-speech-training
 cargo run --example train_small --features ndarray --release
 ```
 
-Abridged output. Exact loss values vary with model initialization:
+Output (loss values vary with initialization):
 
 ```
-burn-speech-training: quick-start example
-
-Training SpeechAligner on synthetic data (CPU)...
-
-Model: SpeechAligner (122.0K parameters)
-Config: input_dim=13, num_classes=42, heads=2
-
-Synthetic smoke test: fixed batch=2, time=30, targets=6/sample
-Training for 5 epochs...
-
-  Epoch 1/5: loss = ...
-  Epoch 2/5: loss = ...
-  Epoch 3/5: loss = ...
-  Epoch 4/5: loss = ...
-  Epoch 5/5: loss = ...
+SpeechAligner: 122049 parameters, input_dim=13, classes=42
+step 1/5  ctc_loss=86.5541
+step 2/5  ctc_loss=63.5815
+step 3/5  ctc_loss=45.0241
+step 4/5  ctc_loss=30.4534
+step 5/5  ctc_loss=21.7830
+phoneme_logits  [1, 30, 42]
+boundary_logits [1, 30, 1]
+ctc_log_probs   [30, 1, 42]
 ```
 
 The example is a synthetic smoke test. It verifies model initialization, forward
@@ -143,9 +137,9 @@ default; treat GPU backends as local hardware targets to validate.
 
 ### Precomputed features
 
-For fast ablation, precompute MFCC features to a binary cache. In the original
-experiment setup this moved runs from roughly 2 hours to roughly 30 minutes,
-but the exact speedup depends on hardware, dataset size, and feature mode. See
+For fast ablation, precompute MFCC features to a binary cache. In the experiments
+below this cut a run from roughly 2 hours to roughly 30 minutes, but the exact
+speedup depends on hardware, dataset size, and feature mode. See
 `src/precompute.rs` for the cache format and `src/train.rs` for the precomputed
 training path.
 
@@ -164,7 +158,7 @@ scores on [SpeechOcean762](https://www.openslr.org/83/)).
 | 3. Scoring head | 1 | 0.221 | Adding a pronunciation scoring MLP trained on human labels reaches 0.22, then plateaus |
 | 4. Loss ablation | 13 | 0.292 | Disabling CTC loss during scoring is the single biggest gain (+0.07 ρ). In this setup, the CTC gradient hurt scoring. |
 | 5. Schedule search | 5 | 0.292 | Warmup, freeze schedules, LR decay — marginal gains. ≈0.29 ceiling is reproducible. |
-| 6. Architecture search | 13 | 0.288 | Rank regularization, ordinal loss, attention pooling, distillation — none broke through |
+| 6. Architecture search | 13 | 0.288 | Ordinal loss and attention pooling didn't help. The distillation and rank-regularization runs had bugs and are inconclusive (see the log). |
 
 **Best result**: ρ = 0.292 (Spearman correlation with human pronunciation
 scores).
@@ -187,10 +181,8 @@ scores).
 - **Focal loss** — hurts ranking ability
 - **Inverse-frequency class weighting** — no improvement
 - **Larger scoring head** (512 → 256 vs 256 → 128) — no effect
-- **Rank regularization** — matched baseline, didn't exceed
 - **Ordinal softmax CE** — worse than MSE
 - **Attention pooling** — regressed
-- **Knowledge distillation** — reproduced baseline, no gain
 
 ### Why it plateaued
 
@@ -203,7 +195,7 @@ example, self-supervised speech representations) are the likely path forward.
 See [`docs/experiment-log.md`](docs/experiment-log.md) for the full experiment
 log with per-run configs and results.
 
-## Trust And Scope Docs
+## Further reading
 
 - [`docs/datasets.md`](docs/datasets.md): what data is used, what is not
   included, and how to keep provenance clear.
@@ -223,7 +215,7 @@ log with per-run configs and results.
    on loss geometry gained +0.07 ρ total. Richer features are the higher-
    leverage path.
 4. **Precompute features for ablation.** MFCC extraction is a CPU bottleneck.
-   A binary cache made iteration much faster in the original experiment setup.
+   A binary cache made iteration several times faster.
 5. **Evaluate at every checkpoint.** The best model is rarely the last one.
 
 ## Current limits

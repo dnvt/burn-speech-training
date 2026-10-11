@@ -3,6 +3,20 @@
 35 experiments training SpeechAligner on SpeechOcean762, evaluated by Spearman ρ
 against human pronunciation scores.
 
+> **Known issues in Round 6.** A later code review found two implementation
+> bugs that affect how Round 6 should be read:
+>
+> - **Distillation (6a–6c)**: student features were copied to the CPU and back
+>   before the feature-matching loss, which detaches them from the autodiff
+>   graph. Only the projection layer learned; the backbone never received the
+>   distillation gradient.
+> - **Rank regularization (6c, 6d)**: the similarity kernel was computed on mean
+>   squared distances between unit-normalised 512-d vectors, so it stayed
+>   within [0.992, 1.0] and gave almost no gradient.
+>
+> The 0.292 result and Rounds 1–5 are unaffected. "Distillation and rank
+> regularization don't help" is **not** established by these runs.
+
 ---
 
 ## Round 1: Baseline CTC GOP (1 run)
@@ -111,9 +125,10 @@ the backbone hurts significantly. Warmup + cosine is the stable recipe.
 | 6g-6h | Attention pooling (2 variants) | 0.283, 0.282 |
 | 6i-6m | Combined approaches | 0.275-0.288 |
 
-**Result**: None exceeded the 0.292 baseline. The ≈0.29 ceiling is a
-representation quality bottleneck, not a loss or architecture problem. Richer
-input features are the path forward.
+**Result**: None exceeded the 0.292 baseline. Distillation and rank
+regularization runs were affected by the bugs noted at the top of this log, so
+they are inconclusive. The remaining runs are consistent with a representation
+bottleneck rather than a loss or architecture problem.
 
 ---
 
@@ -126,5 +141,5 @@ input features are the path forward.
 | 3. Scoring head | 0.221 | 1 | Supervised scoring reaches 0.22, then plateaus |
 | 4. Loss ablation | 0.292 | 13 | CTC=0 is the single biggest gain |
 | 5. Schedule search | 0.292 | 5 | Ceiling is reproducible across schedules |
-| 6. Architecture | 0.288 | 13 | Structural changes don't break through |
+| 6. Architecture | 0.288 | 13 | No gain; distillation/rank-reg runs were buggy |
 | **Total** | **0.292** | **35** | **Bottleneck is feature representation** |

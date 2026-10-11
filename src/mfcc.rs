@@ -6,8 +6,6 @@
 //! - `logmel80`: pre-emphasis -> framing -> Hann -> FFT -> 80-bin mel bank ->
 //!   log energy.
 
-#![allow(clippy::indexing_slicing)] // Bounded by construction (all indices < known array sizes)
-
 use std::f32::consts::PI;
 
 use realfft::{RealFftPlanner, RealToComplex};
@@ -218,7 +216,6 @@ impl MfccExtractor {
     }
 
     /// Extract features and return as a Burn tensor `[1, T, D]`.
-    #[allow(dead_code)] // Public API — used in tests and by future callers
     pub fn extract_tensor<B: burn::tensor::backend::Backend>(
         &self,
         samples: &[f32],
@@ -300,9 +297,7 @@ fn pre_emphasis(samples: &[f32]) -> Vec<f32> {
 fn build_hann_window() -> Vec<f32> {
     (0..FRAME_LEN)
         .map(|n| {
-            #[allow(clippy::cast_precision_loss)]
             let x = n as f32;
-            #[allow(clippy::cast_precision_loss)]
             let len = FRAME_LEN as f32;
             0.5 * (1.0 - (2.0 * PI * x / (len - 1.0)).cos())
         })
@@ -328,13 +323,11 @@ fn build_mel_filterbank(num_filters: usize) -> Vec<Vec<f32>> {
     let num_points = num_filters + 2;
     let mel_points: Vec<f32> = (0..num_points)
         .map(|i| {
-            #[allow(clippy::cast_precision_loss)]
             let frac = i as f32 / (num_points - 1) as f32;
             mel_min + frac * (mel_max - mel_min)
         })
         .collect();
 
-    #[allow(clippy::cast_precision_loss)]
     let bin_indices: Vec<f32> = mel_points
         .iter()
         .map(|&mel| mel_to_hz(mel) * FFT_SIZE as f32 / SAMPLE_RATE as f32)
@@ -348,7 +341,6 @@ fn build_mel_filterbank(num_filters: usize) -> Vec<Vec<f32>> {
 
         let mut filter = vec![0.0f32; fft_bins];
         for (k, val) in filter.iter_mut().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
             let k_f = k as f32;
             if k_f > left && k_f <= center {
                 let denom = center - left;
@@ -374,7 +366,6 @@ fn build_dct_matrix(num_filters: usize) -> Vec<Vec<f32>> {
     for i in 0..NUM_CEPSTRAL {
         let mut row = Vec::with_capacity(num_filters);
         for j in 0..num_filters {
-            #[allow(clippy::cast_precision_loss)]
             let val = (PI * i as f32 * (j as f32 + 0.5) / num_filters as f32).cos();
             row.push(val);
         }
@@ -390,18 +381,14 @@ fn compute_deltas(features: &[[f32; NUM_CEPSTRAL]]) -> Vec<[f32; NUM_CEPSTRAL]> 
     let delta_window = 2i32;
 
     // Denominator: 2 * sum(d^2 for d=1..window) = 2*(1+4) = 10
-    #[allow(clippy::cast_precision_loss)]
     let denom: f32 = 2.0 * (1..=delta_window).map(|d| (d * d) as f32).sum::<f32>();
 
     for (t, delta_frame) in deltas.iter_mut().enumerate() {
         for c in 0..NUM_CEPSTRAL {
             let mut numerator = 0.0f32;
             for d in 1..=delta_window {
-                #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
                 let t_plus = (t as i32 + d).min((n as i32) - 1) as usize;
-                #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
                 let t_minus = (t as i32 - d).max(0) as usize;
-                #[allow(clippy::cast_precision_loss)]
                 let d_f = d as f32;
                 numerator += d_f * (features[t_plus][c] - features[t_minus][c]);
             }
@@ -413,7 +400,6 @@ fn compute_deltas(features: &[[f32; NUM_CEPSTRAL]]) -> Vec<[f32; NUM_CEPSTRAL]> 
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -470,7 +456,6 @@ mod tests {
         let num_samples = SAMPLE_RATE;
         let samples: Vec<f32> = (0..num_samples)
             .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
                 let t = i as f32 / SAMPLE_RATE as f32;
                 (2.0 * PI * 440.0 * t).sin() * 0.5
             })
@@ -496,7 +481,6 @@ mod tests {
         let num_samples = SAMPLE_RATE;
         let samples: Vec<f32> = (0..num_samples)
             .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
                 let t = i as f32 / SAMPLE_RATE as f32;
                 (2.0 * PI * 440.0 * t).sin() * 0.5
             })
@@ -551,7 +535,6 @@ mod tests {
         let extractor = MfccExtractor::new();
         let samples: Vec<f32> = (0..SAMPLE_RATE)
             .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
                 let t = i as f32 / SAMPLE_RATE as f32;
                 (2.0 * PI * 440.0 * t).sin() * 0.5
             })
@@ -577,7 +560,6 @@ mod tests {
         let extractor = MfccExtractor::with_mode(FeatureMode::LogMel80);
         let samples: Vec<f32> = (0..SAMPLE_RATE)
             .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
                 let t = i as f32 / SAMPLE_RATE as f32;
                 (2.0 * PI * 440.0 * t).sin() * 0.5
             })

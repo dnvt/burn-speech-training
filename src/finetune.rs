@@ -43,8 +43,6 @@ const ORDINAL_BOUNDARIES: [f32; 4] = [0.2, 0.5, 0.7, 0.9];
 const ORDINAL_BIN_CENTERS: [f32; 5] = [0.1, 0.4, 0.65, 0.85, 1.0];
 const TRIPLET_POSITIVE_GAP: i32 = 1;
 const TRIPLET_NEGATIVE_GAP: i32 = 3;
-const START_GATE: f64 = 0.30;
-const SUCCESS_GATE: f64 = 0.40;
 
 fn default_ordinal_boundaries() -> Vec<f32> {
     ORDINAL_BOUNDARIES.to_vec()
@@ -150,24 +148,14 @@ fn default_scoring_output_dim() -> usize {
 
 #[derive(Deserialize)]
 struct WordDataset {
-    #[allow(dead_code)]
-    metadata: serde_json::Value,
     samples: Vec<WordSample>,
 }
 
 #[derive(Deserialize, Clone)]
 struct WordSample {
-    #[allow(dead_code)]
-    word_id: String,
-    #[allow(dead_code)]
-    text: String,
     human_score: f64,
     human_score_raw: i32,
     audio_file: String,
-    #[allow(dead_code)]
-    phonemes: Vec<String>,
-    #[allow(dead_code)]
-    utterance_id: String,
     word_position: usize,
     sentence_text: String,
 }
@@ -253,7 +241,6 @@ impl<B: Backend> LegacyScoringHead<B> {
     }
 }
 
-#[allow(clippy::struct_excessive_bools)]
 pub struct FineTuneArgs {
     /// Path to the base checkpoint (for example a pre-training checkpoint).
     /// Omit when `fresh_init` is enabled.
@@ -330,7 +317,6 @@ pub struct FineTuneArgs {
     /// Default: false.
     pub freeze_backbone: bool,
     /// Scoring head hidden dimension. Default: 256 (512→256→1).
-    /// Larger values (e.g., 512) test the capacity hypothesis.
     pub scoring_hidden: usize,
     /// Weight for pooled-word embedding rank regularization. 0 disables
     /// it.
@@ -357,8 +343,7 @@ pub struct FineTuneArgs {
     pub distillation_weight: f32,
     /// Use wav2vec2 teacher features as the PRIMARY input to the scoring
     /// head instead of SpeechAligner frame features. Requires
-    /// `--distillation-features`. Skips SpeechAligner backbone entirely.
-    /// Tests whether richer features (1024-dim) improve scoring.
+    /// ``distillation_features``. Skips SpeechAligner backbone entirely.
     pub teacher_as_input: bool,
 }
 
@@ -476,15 +461,12 @@ impl MetricsWriter {
     ) {
         let elapsed = self.run_start.elapsed().as_secs_f64();
         let remaining_epochs = total_epochs.saturating_sub(epoch);
-        #[allow(clippy::cast_precision_loss)]
         let eta_secs = if epoch > 0 {
             (elapsed / epoch as f64) * remaining_epochs as f64
         } else {
             0.0
         };
-        #[allow(clippy::cast_precision_loss)]
         let throughput = utterances as f64 / stats.seconds.max(0.001);
-        #[allow(clippy::cast_precision_loss)]
         let words_per_sec = stats.words as f64 / stats.seconds.max(0.001);
 
         tracing::info!(
@@ -520,7 +502,6 @@ impl MetricsWriter {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn emit_eval(
         &mut self,
         epoch: usize,
@@ -1021,7 +1002,6 @@ fn balanced_mse_loss<B: Backend>(
     (-selected.mean()) * (2.0 * noise_sigma * noise_sigma)
 }
 
-#[allow(clippy::indexing_slicing)] // row/col loops are bounded by batch_size
 fn pairwise_ranking_loss<B: Backend>(
     predicted_scores: Tensor<B, 1>,
     raw_scores: &[i32],
@@ -1059,7 +1039,6 @@ fn pairwise_ranking_loss<B: Backend>(
     (losses * mask).sum().reshape([1]) / valid_pairs as f32
 }
 
-#[allow(clippy::indexing_slicing)] // anchor/other loops are bounded by batch_size
 fn triplet_ranking_loss<B: Backend>(
     pooled_features: Tensor<B, 2>,
     raw_scores: &[i32],
@@ -1335,7 +1314,7 @@ where
     let config = SpeechAlignerConfig::for_feature_mode(args.feature_mode);
     if !args.fresh_init && args.checkpoint.is_none() {
         return Err(Error::config(
-            "--checkpoint is required unless --fresh-init is set",
+            "`checkpoint` is required unless `fresh_init` is set",
         ));
     }
     step(if args.fresh_init {
@@ -1347,7 +1326,7 @@ where
     let scoring_input_dim = if teacher_as_input {
         if args.distillation_features.is_none() {
             return Err(Error::config(
-                "--teacher-as-input requires --distillation-features",
+                "`teacher_as_input` requires `distillation_features`",
             ));
         }
         detail(&format!(
@@ -1364,7 +1343,7 @@ where
     } else {
         load_model_checkpoint::<TrainB>(
             args.checkpoint.as_deref().ok_or_else(|| {
-                Error::config("--checkpoint is required unless --fresh-init is set")
+                Error::config("`checkpoint` is required unless `fresh_init` is set")
             })?,
             &config,
             device,
@@ -1372,7 +1351,7 @@ where
         .map_err(|err| {
             Error::process(format!(
                 "{err}. If this checkpoint was trained with a different feature shape, rerun \
-                 with --fresh-init."
+                 with `fresh_init`."
             ))
         })?
     };
@@ -1461,7 +1440,7 @@ where
         ));
         if loaded == 0 && teacher_as_input {
             return Err(Error::config(
-                "--teacher-as-input matched 0 utterances in --distillation-features",
+                "`teacher_as_input` matched 0 utterances in `distillation_features`",
             ));
         }
         if loaded == 0 {
@@ -1477,7 +1456,7 @@ where
     // Load holdout for inline evaluation (if configured)
     if args.holdout.is_some() && args.eval_interval == 0 {
         tracing::warn!(
-            "--holdout provided but --eval-interval is 0; holdout will not be evaluated"
+            "`holdout` provided but `eval_interval` is 0; holdout will not be evaluated"
         );
     }
     let holdout = if args.eval_interval > 0 {
@@ -1611,7 +1590,6 @@ where
                 None
             } else {
                 // Pad and stack input frames: [batch, max_frames, feature_dim]
-                #[allow(clippy::indexing_slicing)]
                 // bounded: offset + feature_dim <= flat.len()
                 let input = {
                     let mut flat = vec![0.0f32; cur_batch * max_frames * input_feature_dim];
@@ -1642,7 +1620,6 @@ where
                 Some(model.forward_with_pad_mask(input, mask_pad))
             };
 
-            #[allow(clippy::cast_possible_wrap, clippy::indexing_slicing)]
             let ctc_loss = if let Some(output) = output.as_ref() {
                 let mut flat_targets = vec![0i32; cur_batch * max_targets];
                 let mut input_lens = Vec::with_capacity(cur_batch);
@@ -2045,7 +2022,6 @@ where
         }
 
         let seconds = epoch_start.elapsed().as_secs_f64();
-        #[allow(clippy::cast_precision_loss)]
         let stats = if batches > 0 {
             EpochStats {
                 ctc_loss: (ctc_sum / batches as f64) as f32,
@@ -2167,7 +2143,6 @@ fn prepare_utterances(
     samples: &[WordSample],
 ) -> Result<Vec<PreparedUtterance>> {
     // Compute per-score weights if enabled
-    #[allow(clippy::if_then_some_else_none)] // side-effect: detail() logging
     let bucket_weights = if args.weighted_loss || args.score_balanced_loss {
         let mut counts = std::collections::BTreeMap::<i32, usize>::new();
         for s in samples {
@@ -2194,7 +2169,6 @@ fn prepare_utterances(
             let weights: std::collections::BTreeMap<i32, f32> = counts
                 .iter()
                 .map(|(&score, &count)| {
-                    #[allow(clippy::cast_precision_loss)]
                     let w = (max_count as f32 / count.max(1) as f32).min(max_weight);
                     (score, w)
                 })
@@ -2277,7 +2251,6 @@ fn prepare_utterances(
                     .unwrap_or(1.0);
                 WordTarget {
                     word_position: sample.word_position,
-                    #[allow(clippy::cast_possible_truncation)]
                     human_score: sample.human_score as f32,
                     human_score_raw: sample.human_score_raw,
                     num_words,
@@ -2286,7 +2259,7 @@ fn prepare_utterances(
             })
             .collect();
 
-        // Oversample low-score words (Experiment 3C)
+        // Oversample low-score words
         if args.oversample_factor > 1 {
             let originals: Vec<WordTarget> = words.clone();
             for word in &originals {
@@ -2531,7 +2504,7 @@ fn load_holdout(
     if teacher_mode && utterances.is_empty() {
         return Err(Error::config(
             "Teacher-feature holdout evaluation matched 0 utterances. Ensure \
-             --distillation-features contains the holdout split, not only the training set.",
+             `distillation_features` contains the holdout split, not only the training set.",
         ));
     }
 
@@ -2615,7 +2588,6 @@ fn run_holdout_eval<B: Backend>(
     (rho, pcc, ci, predicted.len())
 }
 
-#[allow(clippy::indexing_slicing)] // Bounded by construction: offset + feature_dim <= flat.len()
 fn frames_to_tensor<B: Backend>(
     frames: &[Vec<f32>],
     feature_dim: usize,
@@ -2679,7 +2651,6 @@ fn build_scoring_batch<B: Backend>(
     Some((pooled_features, targets, weights))
 }
 
-#[allow(clippy::needless_pass_by_value)] // Tensor::to_data consumes self
 fn scalar_from_tensor<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> Result<f32> {
     tensor
         .to_data()
@@ -2962,50 +2933,16 @@ fn generate_finetune_report(
             .iter()
             .max_by(|left, right| left.rho.total_cmp(&right.rho))
         {
-            report.push_str("\n## Gate Snapshot\n\n");
-            if best_eval.rho >= SUCCESS_GATE {
-                let _ = writeln!(
-                    report,
-                    "**FULL SUCCESS** — best inline holdout ρ = {:.4} at epoch {} meets the \
-                     {:.2} full-success gate.",
-                    best_eval.rho, best_eval.epoch, SUCCESS_GATE
-                );
-            } else if best_eval.rho >= START_GATE {
-                let _ = writeln!(
-                    report,
-                    "**START GATE PASS** — best inline holdout ρ = {:.4} at epoch {} meets \
-                     the {:.2} start gate, but remains below the {:.2} \
-                     full-success gate.",
-                    best_eval.rho, best_eval.epoch, START_GATE, SUCCESS_GATE
-                );
-            } else {
-                let _ = writeln!(
-                    report,
-                    "**FAIL** — best inline holdout ρ = {:.4} at epoch {} remains below the \
-                     {:.2} start gate.",
-                    best_eval.rho, best_eval.epoch, START_GATE
-                );
-            }
+            let _ = writeln!(
+                report,
+                "\n**Best holdout**: ρ = {:.4} at epoch {}.",
+                best_eval.rho, best_eval.epoch
+            );
         }
     } else {
         report.push_str(
             "\n## Inline Holdout Evaluation\n\nNo inline holdout evaluation was recorded for \
              this run.\n",
-        );
-    }
-    report.push_str("\n## Next Step\n\n");
-    if args.teacher_as_input {
-        report.push_str(
-            "Run the evaluation with --checkpoint <base> --scoring-head \
-             <head> --distillation-features <cache>` against the holdout split for a final \
-             audit, but use the inline holdout table above as the primary training artifact \
-             for gate review.\n",
-        );
-    } else {
-        report.push_str(
-            "Run the evaluation with --checkpoint <base> --scoring-head \
-             <head>` against the holdout split for a final audit, but use the inline holdout \
-             table above as the primary training artifact for gate review.\n",
         );
     }
     report

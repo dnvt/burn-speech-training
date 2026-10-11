@@ -242,7 +242,6 @@ mod tests {
 
     type B = NdArray<f32>;
 
-    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn init_model(config: &SpeechAlignerConfig, device: &NdArrayDevice) -> SpeechAligner<B> {
         match config.init(device) {
             Ok(model) => model,
@@ -353,7 +352,7 @@ mod tests {
         );
         assert!(
             count < 3_000_000,
-            "model should have <3M params (not the 6.4M Conv2d variant), got {count}"
+            "model should have <3M params, got {count}"
         );
     }
 

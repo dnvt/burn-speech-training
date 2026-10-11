@@ -1,8 +1,7 @@
-//! CTC loss wrapper for `SpeechAligner`.
+//! CTC loss for `SpeechAligner`.
 //!
-//! The model trains against synthetic CTC targets only. The
-//! phoneme and boundary heads remain part of the model surface, but their
-//! supervised losses land in a later phase when real labels are available.
+//! Only the CTC head is trained. The phoneme and boundary heads are part of
+//! the model output but have no loss attached.
 
 use burn::nn::loss::{CTCLoss, CTCLossConfig};
 use burn::tensor::backend::Backend;
@@ -21,7 +20,7 @@ impl SpeechAlignerLossConfig {
     }
 }
 
-/// Loss module for synthetic CTC training.
+/// CTC loss over the model's `ctc_log_probs` output.
 pub struct SpeechAlignerLoss {
     ctc_loss: CTCLoss,
 }

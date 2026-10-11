@@ -1,5 +1,5 @@
-//! Simple logging helpers replacing the original CLI UI functions.
-//! These use tracing so consumers can control output via subscriber config.
+//! Progress logging helpers. Output goes through `tracing`, so nothing is
+//! printed unless the caller installs a subscriber.
 pub fn section(msg: &str) {
     tracing::info!("=== {} ===", msg);
 }

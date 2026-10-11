@@ -102,7 +102,6 @@ mod tests {
 
     type B = NdArray<f32>;
 
-    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn init_attention(
         device: &NdArrayDevice,
         d_model: usize,

@@ -48,11 +48,9 @@ pub fn execute_train_real(args: &TrainRealArgs) -> Result<()> {
         return Err(Error::config("batch_size must be > 0"));
     }
 
-    // Step 1: Load data (backend-independent)
     let samples = load_and_extract(args)?;
 
-    // Phase 4: Train with the appropriate backend
-    // Priority: CUDA > WGPU > NdArray (CPU fallback)
+    // Backend priority: CUDA > WGPU > NdArray.
     #[cfg(feature = "cuda")]
     {
         use burn::backend::cuda::CudaDevice;
@@ -116,7 +114,7 @@ fn load_and_extract(args: &TrainRealArgs) -> Result<Vec<crate::dataset::Training
     let utterances = scan_librispeech(&args.data_dir, &args.split, args.max_duration_secs)?;
     detail(&format!("  Found {} utterances", utterances.len()));
 
-    step("Phase 3: Extracting features");
+    step("Extracting features");
     let mut samples = Vec::new();
     let mut skipped = 0usize;
     let mut total_oov = 0usize;
@@ -158,14 +156,8 @@ fn load_and_extract(args: &TrainRealArgs) -> Result<Vec<crate::dataset::Training
     Ok(samples)
 }
 
-// -----------------------------------------------------------------------
-// Structured training metrics (JSON-lines + tracing)
-// -----------------------------------------------------------------------
-
-/// Writes structured JSON-lines metrics to a file alongside the checkpoint
-/// directory. Each line is a self-contained JSON object parseable by:
-/// - Structured JSON logs for external monitoring
-/// - Log aggregation dashboards (configure per deployment)
+/// Writes one JSON object per line to `training-metrics.jsonl` in the
+/// checkpoint directory, and mirrors each event to `tracing`.
 struct MetricsWriter {
     file: Option<std::fs::File>,
     run_start: Instant,
@@ -197,7 +189,6 @@ impl MetricsWriter {
     }
 
     /// Emit a batch-level metric (every N batches).
-    #[allow(clippy::too_many_arguments)]
     fn emit_batch(
         &mut self,
         epoch: usize,
@@ -228,7 +219,6 @@ impl MetricsWriter {
             "training_batch"
         );
 
-        // JSON-lines file for Grafana/offline analysis
         if let Some(ref mut f) = self.file {
             let _ = writeln!(
                 f,
@@ -239,7 +229,6 @@ impl MetricsWriter {
     }
 
     /// Emit an epoch-level summary.
-    #[allow(clippy::too_many_arguments)]
     fn emit_epoch(
         &mut self,
         epoch: usize,
@@ -251,13 +240,11 @@ impl MetricsWriter {
     ) {
         let elapsed = self.elapsed_secs();
         let remaining_epochs = total_epochs.saturating_sub(epoch);
-        #[allow(clippy::cast_precision_loss)]
         let eta_secs = if epoch > 0 {
             (elapsed / epoch as f64) * remaining_epochs as f64
         } else {
             0.0
         };
-        #[allow(clippy::cast_precision_loss)]
         let throughput = total_samples as f64 / epoch_secs.max(0.001);
 
         tracing::info!(
@@ -429,7 +416,7 @@ where
     SpeechAligner<TrainB>: AutodiffModule<TrainB, InnerModule = SpeechAligner<InferB>>,
 {
     step(&format!(
-        "Phase 4: Training ({} epochs, batch_size={}, lr={}, backend={})",
+        "Training ({} epochs, batch_size={}, lr={}, backend={})",
         args.epochs, args.batch_size, args.learning_rate, backend_name
     ));
 
@@ -514,7 +501,6 @@ where
             }
         }
 
-        #[allow(clippy::cast_precision_loss)]
         let avg_loss = if batch_count > 0 {
             (epoch_loss_sum / batch_count as f64) as f32
         } else {
@@ -611,9 +597,8 @@ fn generate_training_report(
         "**Date**: {}",
         chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
     );
-    report.push_str("**Burn Version**: 0.21.0-pre.2\n");
     let _ = writeln!(report, "**Backend**: {backend_name}");
-    report.push_str("**Model**: SpeechAligner (4x ConvSE + Self-Attention + Triple Head)\n");
+    report.push_str("**Model**: SpeechAligner\n");
     let _ = writeln!(report, "**Parameters**: {params}");
     let _ = writeln!(report, "**Dataset**: {}", args.data_dir.display());
     let _ = writeln!(report, "**Split**: {}", args.split);
@@ -631,14 +616,9 @@ fn generate_training_report(
     for (i, l) in losses.iter().enumerate() {
         let _ = writeln!(report, "| {} | {l:.6} |", i + 1);
     }
-    report.push_str(
-        "\n## Specification References\n\n- Data: \
-         LibriSpeech\n",
-    );
     report
 }
 
-#[allow(clippy::too_many_arguments)]
 fn generate_precomputed_training_report(
     args: &TrainPrecomputedArgs,
     manifest: &PrecomputedManifest,
@@ -657,9 +637,8 @@ fn generate_precomputed_training_report(
         "**Date**: {}",
         chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
     );
-    report.push_str("**Burn Version**: 0.21.0-pre.2\n");
     let _ = writeln!(report, "**Backend**: {backend_name}");
-    report.push_str("**Model**: SpeechAligner (4x ConvSE + Self-Attention + Triple Head)\n");
+    report.push_str("**Model**: SpeechAligner\n");
     let _ = writeln!(report, "**Parameters**: {params}");
     let _ = writeln!(report, "**Cache Dir**: {}", args.cache_dir.display());
     let _ = writeln!(report, "**Source Data**: {}", manifest.data_dir);
@@ -692,22 +671,14 @@ fn generate_precomputed_training_report(
     }
     report.push_str(
         "\n---\n\n## Batching Strategy\n\n- Attention-aware dynamic batching (`B × heads × \
-         T²`)\n- Precomputed MFCC cache (no on-the-fly extraction)\n\n## Loss Curve\n\n",
+         T²`)\n- Precomputed feature cache\n\n## Loss Curve\n\n",
     );
     report.push_str("| Epoch | Avg Loss |\n|---|---|\n");
     for (i, loss) in losses.iter().enumerate() {
         let _ = writeln!(report, "| {} | {loss:.6} |", i + 1);
     }
-    report.push_str(
-        "\n## Specification References\n\n- Data: \
-         LibriSpeech precomputed MFCC cache\n",
-    );
     report
 }
-
-// =====================================================================
-// Precomputed training: loads from binary cache, no MFCC
-// =====================================================================
 
 /// Arguments for precomputed training (fast ablation mode).
 pub struct TrainPrecomputedArgs {
@@ -980,7 +951,6 @@ where
             }
         }
 
-        #[allow(clippy::cast_precision_loss)]
         let avg_loss = if batch_count > 0 {
             (epoch_loss_sum / batch_count as f64) as f32
         } else {
