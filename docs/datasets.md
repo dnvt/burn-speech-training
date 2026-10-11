@@ -25,15 +25,19 @@ It is not evidence of real speech quality.
 - Used for: pronunciation scoring experiments and Spearman correlation against
   human word-level scores.
 - Included in this repo: no.
+- Format: the crate reads a flattened file with one entry per word; the
+  fields are documented in `src/data/so762.rs`.
 - Notes: the reported score plateau should be read in the context of this
   dataset and split. The experiment log records the runs and limitations.
 
 ## CMU Pronouncing Dictionary
 
-- Source: Carnegie Mellon University Pronouncing Dictionary.
+- Source: [cmusphinx/cmudict](https://github.com/cmusphinx/cmudict).
 - Used for: transcript to ARPABET phoneme lookup in the G2P path.
-- Included in this repo: a compact generated lookup is built into the crate.
-- Notes: unknown words use the crate's fallback path, so G2P quality is a known
+- Included in this repo: yes, `src/g2p/data/cmudict.dict` is embedded in the
+  crate and parsed on first use.
+- License: BSD-style, Carnegie Mellon University. See `src/g2p/data/LICENSE`.
+- Notes: unknown words use the crate's fallback rules, so G2P quality is a known
   limitation for out-of-vocabulary text.
 
 ## Private Or User Audio

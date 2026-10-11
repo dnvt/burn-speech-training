@@ -8,9 +8,11 @@ present the model as production-ready.
 
 - Name: `SpeechAligner`
 - Framework: Burn 0.21
-- Default shape: CNN + squeeze-and-excitation blocks + self-attention + CTC head
-- Default size: about 1.7M parameters
-- Quickstart size: about 122K parameters
+- Default shape: 4 Conv1d + squeeze-and-excitation blocks, one self-attention
+  layer, CTC head; see the README for the full layer list
+- Default size: 1,709,837 parameters
+- Quickstart size: 122,049 parameters
+- Scoring head (fine-tuning): 512 → 256 → 1 MLP over mean-pooled word frames
 
 ## Intended Use
 
@@ -49,6 +51,7 @@ representation and data limits more than another small loss-function tweak.
 
 - MFCC/log-mel features may be too weak for robust pronunciation ranking.
 - CTC alignment loss can interfere with scoring fine-tuning in this setup.
+- Word boundaries are approximated by splitting frames evenly across words.
 - SpeechOcean762 word scores are heavily imbalanced toward perfect scores.
 - Out-of-vocabulary words depend on fallback phoneme handling.
 - GPU features are hardware-dependent and not fully covered by CI.
@@ -58,7 +61,7 @@ representation and data limits more than another small loss-function tweak.
 For a quick smoke test:
 
 ```bash
-cargo run --example train_small --features ndarray --release
+cargo run --release --example train_small
 ```
 
 For experiment claims, prefer linking to `docs/experiment-log.md` and include
