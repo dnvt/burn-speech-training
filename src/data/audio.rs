@@ -2,13 +2,11 @@
 
 use std::path::Path;
 
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::errors::Error as DecodeError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 use crate::error::{Error, Result};
 use crate::mfcc::SAMPLE_RATE;
@@ -30,20 +28,24 @@ pub fn load(path: &Path) -> Result<Vec<f32>> {
     }
 
     let mut reader = symphonia::default::get_probe()
-        .format(
+        .probe(
             &hint,
             stream,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
-        .map_err(|err| bad("unsupported audio", &err))?
-        .format;
+        .map_err(|err| bad("unsupported audio", &err))?;
     let track = reader
-        .default_track()
+        .default_track(TrackType::Audio)
         .ok_or_else(|| Error::data(format!("{}: no audio track", path.display())))?;
     let track_id = track.id;
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .ok_or_else(|| Error::data(format!("{}: no audio codec parameters", path.display())))?;
 
-    if let Some(rate) = track.codec_params.sample_rate {
+    if let Some(rate) = params.sample_rate {
         if rate as usize != SAMPLE_RATE {
             return Err(Error::data(format!(
                 "{}: sample rate is {rate} Hz, expected {SAMPLE_RATE} Hz (resample first)",
@@ -53,36 +55,31 @@ pub fn load(path: &Path) -> Result<Vec<f32>> {
     }
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
         .map_err(|err| bad("cannot create decoder", &err))?;
 
     let mut samples = Vec::new();
-    loop {
-        let packet = match reader.next_packet() {
-            Ok(packet) => packet,
-            Err(DecodeError::IoError(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break
-            }
-            Err(err) => return Err(bad("read error", &err)),
-        };
-        if packet.track_id() != track_id {
+    let mut interleaved: Vec<f32> = Vec::new();
+    while let Some(packet) = reader
+        .next_packet()
+        .map_err(|err| bad("read error", &err))?
+    {
+        if packet.track_id != track_id {
             continue;
         }
 
         let decoded = decoder
             .decode(&packet)
             .map_err(|err| bad("decode error", &err))?;
-        let spec = *decoded.spec();
-        let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-        buffer.copy_interleaved_ref(decoded);
+        let channels = decoded.spec().channels().count().max(1);
+        interleaved.resize(decoded.samples_interleaved(), 0.0);
+        decoded.copy_to_slice_interleaved(&mut interleaved);
 
-        let channels = spec.channels.count();
         if channels == 1 {
-            samples.extend_from_slice(buffer.samples());
+            samples.extend_from_slice(&interleaved);
         } else {
             samples.extend(
-                buffer
-                    .samples()
+                interleaved
                     .chunks(channels)
                     .map(|frame| frame.iter().sum::<f32>() / channels as f32),
             );
@@ -142,6 +139,33 @@ mod tests {
         let decoded = load(&path).expect("decode");
         assert_eq!(decoded.len(), tone.len());
         assert!((decoded[100] - tone[100]).abs() < 1e-3);
+    }
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data")
+            .join(name)
+    }
+
+    #[test]
+    fn decodes_flac() {
+        // 0.5 s of a 440 Hz tone, the format LibriSpeech ships in.
+        let decoded = load(&fixture("tone-mono-16k.flac")).expect("decode");
+        assert_eq!(decoded.len(), 8_000);
+        let peak = decoded.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak > 0.1, "peak {peak}");
+    }
+
+    #[test]
+    fn downmixes_stereo_to_mono() {
+        // Same tone in the left channel, silence in the right: the mono mix
+        // is the tone at half amplitude.
+        let mono = load(&fixture("tone-mono-16k.flac")).expect("mono");
+        let stereo = load(&fixture("tone-stereo-16k.flac")).expect("stereo");
+        assert_eq!(stereo.len(), mono.len());
+        for (m, s) in mono.iter().zip(&stereo).step_by(97) {
+            assert!((m * 0.5 - s).abs() < 1e-3, "{m} vs {s}");
+        }
     }
 
     #[test]

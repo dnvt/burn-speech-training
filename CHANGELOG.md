@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- symphonia 0.6 (audio decoding) and rand 0.10. Decoded audio is unchanged
+  (checked against FLAC fixtures under both versions). Bootstrap confidence
+  intervals use a fixed seed, but rand's generator changed, so their exact
+  bounds can differ slightly from 0.2.0.
+
 ## 0.2.0 - 2026-10-11
 
 The crate was reorganised around a smaller API. Breaking changes throughout.
