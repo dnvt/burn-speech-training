@@ -8,3 +8,6 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    ignore:
+      # The `@1.92` ref pins the minimum supported Rust version on purpose.
+      - dependency-name: dtolnay/rust-toolchain
