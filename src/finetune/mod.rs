@@ -16,17 +16,15 @@ pub mod head;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use burn::module::AutodiffModule;
+use burn::module::Module;
 use burn::nn::loss::CTCLossConfig;
-use burn::optim::{AdamConfig, GradientsParams, Optimizer};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Shape, Tensor, TensorData};
+use burn::optim::{AdamConfig, GradientsParams};
+use burn::tensor::{Device, Shape, Tensor, TensorData};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde_json::json;
 
-use crate::backend::{self, InferBackend, TrainBackend};
 use crate::checkpoint;
 use crate::data::batch::collate;
 use crate::data::TrainingSample;
@@ -141,12 +139,12 @@ impl FineTuneConfig {
     pub(crate) fn init_backbone(
         &self,
         config: &SpeechAlignerConfig,
-        device: &backend::Device,
-    ) -> Result<SpeechAligner<TrainBackend>> {
-        TrainBackend::seed(device, self.seed);
+        device: &Device,
+    ) -> Result<SpeechAligner> {
+        device.seed(self.seed);
         let model = config.init(device)?;
         match &self.base_checkpoint {
-            Some(path) => checkpoint::load(model, path, device),
+            Some(path) => checkpoint::load(model, path),
             None => Ok(model),
         }
     }
@@ -174,9 +172,9 @@ pub struct FineTuneSummary {
 }
 
 /// Pooled word features and their targets for one batch.
-pub(crate) struct WordBatch<B: Backend> {
+pub(crate) struct WordBatch {
     /// `[words, dim]`
-    pub pooled: Tensor<B, 2>,
+    pub pooled: Tensor<2>,
     pub targets: Vec<f32>,
     pub weights: Vec<f32>,
     /// Used by the experimental losses.
@@ -186,11 +184,11 @@ pub(crate) struct WordBatch<B: Backend> {
 
 /// Pool each scored word of each utterance. `frame_features(i)` returns the
 /// `[frames, dim]` features of utterance `i`, or `None` to skip it.
-pub(crate) fn pool_words<B: Backend>(
-    head: &ScoringHead<B>,
+pub(crate) fn pool_words(
+    head: &ScoringHead,
     utterances: &[&ScoredUtterance],
-    frame_features: impl Fn(usize) -> Option<Tensor<B, 2>>,
-) -> Option<WordBatch<B>> {
+    frame_features: impl Fn(usize) -> Option<Tensor<2>>,
+) -> Option<WordBatch> {
     let mut pooled = Vec::new();
     let (mut targets, mut weights, mut raw_scores) = (Vec::new(), Vec::new(), Vec::new());
     for (i, utterance) in utterances.iter().enumerate() {
@@ -218,18 +216,18 @@ pub(crate) fn pool_words<B: Backend>(
     })
 }
 
-pub(crate) fn tensor_1d<B: Backend>(values: Vec<f32>, device: &B::Device) -> Tensor<B, 1> {
+pub(crate) fn tensor_1d(values: Vec<f32>, device: &Device) -> Tensor<1> {
     let n = values.len();
     Tensor::from_data(TensorData::new(values, Shape::new([n])), device)
 }
 
 /// Correlate head predictions with human scores. `frame_features(i)` gives
 /// the `[frames, dim]` input for utterance `i` (or `None` to skip it).
-pub(crate) fn correlate<B: Backend>(
-    head: &ScoringHead<B>,
+pub(crate) fn correlate(
+    head: &ScoringHead,
     config: &ScoringHeadConfig,
     utterances: &[ScoredUtterance],
-    frame_features: impl Fn(usize) -> Option<Tensor<B, 2>>,
+    frame_features: impl Fn(usize) -> Option<Tensor<2>>,
 ) -> Correlation {
     let (mut predicted, mut human, mut groups) = (Vec::new(), Vec::new(), Vec::new());
     for (i, utterance) in utterances.iter().enumerate() {
@@ -257,12 +255,12 @@ pub(crate) fn correlate<B: Backend>(
 }
 
 /// Backbone frame features for a single unpadded utterance, `[frames, dim]`.
-pub(crate) fn backbone_features<B: Backend>(
-    model: &SpeechAligner<B>,
+pub(crate) fn backbone_features(
+    model: &SpeechAligner,
     sample: &TrainingSample,
-    device: &B::Device,
-) -> Tensor<B, 2> {
-    let input = Tensor::<B, 3>::from_data(
+    device: &Device,
+) -> Tensor<2> {
+    let input = Tensor::<3>::from_data(
         TensorData::new(
             sample.features.clone(),
             Shape::new([1, sample.num_frames(), sample.feature_dim]),
@@ -273,35 +271,35 @@ pub(crate) fn backbone_features<B: Backend>(
 }
 
 pub fn evaluate_holdout(
-    model: &SpeechAligner<InferBackend>,
-    head: &ScoringHead<InferBackend>,
+    model: &SpeechAligner,
+    head: &ScoringHead,
     config: &ScoringHeadConfig,
     holdout: &[ScoredUtterance],
 ) -> Correlation {
-    let device = backend::default_device();
+    let device = Device::default();
     correlate(head, config, holdout, |i| {
         Some(backbone_features(model, &holdout[i].sample, &device))
     })
 }
 
 /// Save the model, head and their configs under the given checkpoint names.
-pub(crate) fn save_pair<B: Backend>(
+pub(crate) fn save_pair(
     dir: &Path,
-    model: &SpeechAligner<B>,
-    head: &ScoringHead<B>,
+    model: &SpeechAligner,
+    head: &ScoringHead,
     model_name: &str,
     head_name: &str,
 ) -> Result<(PathBuf, PathBuf)> {
-    let (model_path, head_path) = (dir.join(model_name), dir.join(head_name));
-    checkpoint::save(model, &model_path)?;
-    checkpoint::save(head, &head_path)?;
-    Ok((model_path, head_path))
+    Ok((
+        checkpoint::save(model, &dir.join(model_name))?,
+        checkpoint::save(head, &dir.join(head_name))?,
+    ))
 }
 
 /// Fine-tune a backbone and scoring head. See the module docs.
 pub fn finetune(config: &FineTuneConfig) -> Result<FineTuneSummary> {
     config.validate()?;
-    let device = backend::default_device();
+    let device = Device::default().autodiff();
 
     let mut utterances = data::load(
         &config.dataset,
@@ -321,7 +319,7 @@ pub fn finetune(config: &FineTuneConfig) -> Result<FineTuneSummary> {
         backbone_config.channels[3],
         config.head_hidden_dim,
     );
-    let mut head = head_config.init::<TrainBackend>(&device);
+    let mut head = head_config.init(&device);
 
     error::create_dir_all(&config.checkpoint_dir)?;
     checkpoint::save_model_config(&config.checkpoint_dir, &backbone_config)?;
@@ -329,19 +327,18 @@ pub fn finetune(config: &FineTuneConfig) -> Result<FineTuneSummary> {
     let mut metrics = MetricsWriter::create(&config.checkpoint_dir.join(METRICS_FILE))?;
 
     tracing::info!(
-        "fine-tuning on {} utterances ({} words), {} holdout utterances, backend {}",
+        "fine-tuning on {} utterances ({} words), {} holdout utterances, {device:?}",
         utterances.len(),
         utterances.iter().map(|u| u.words.len()).sum::<usize>(),
         holdout.len(),
-        backend::BACKEND_NAME
     );
 
     utterances.sort_by_key(|u| u.sample.num_frames());
     let mut batches: Vec<&[ScoredUtterance]> = utterances.chunks(config.batch_size).collect();
     let mut rng = StdRng::seed_from_u64(config.seed);
     let ctc = CTCLossConfig::new().with_zero_infinity(true).init();
-    let mut model_optimizer = AdamConfig::new().init::<TrainBackend, SpeechAligner<TrainBackend>>();
-    let mut head_optimizer = AdamConfig::new().init::<TrainBackend, ScoringHead<TrainBackend>>();
+    let mut model_optimizer = AdamConfig::new().init();
+    let mut head_optimizer = AdamConfig::new().init();
 
     let mut epochs = Vec::with_capacity(config.epochs);
     let mut best: Option<(usize, Correlation, PathBuf, PathBuf)> = None;
@@ -362,7 +359,7 @@ pub fn finetune(config: &FineTuneConfig) -> Result<FineTuneSummary> {
         for batch_utts in &batches {
             let samples: Vec<TrainingSample> =
                 batch_utts.iter().map(|u| u.sample.clone()).collect();
-            let batch = collate::<TrainBackend>(&samples, &device);
+            let batch = collate(&samples, &device);
             let output = model.forward_with_pad_mask(batch.inputs, batch.pad_mask);
 
             let ctc_loss = if config.ctc_weight > 0.0 {
@@ -604,8 +601,7 @@ pub(crate) mod tests {
 
         // The saved head reloads with its config.
         let (_, head_config) =
-            ScoringHead::<InferBackend>::load(&summary.final_head, &backend::default_device())
-                .expect("load");
+            ScoringHead::load(&summary.final_head, &Device::default()).expect("load");
         assert_eq!(head_config.input_dim, 16);
     }
 }

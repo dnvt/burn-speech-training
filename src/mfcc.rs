@@ -174,11 +174,11 @@ impl MfccExtractor {
     }
 
     /// Extract features as a `[1, frames, feature_dim]` tensor.
-    pub fn extract_tensor<B: burn::tensor::backend::Backend>(
+    pub fn extract_tensor(
         &self,
         samples: &[f32],
-        device: &B::Device,
-    ) -> Result<burn::tensor::Tensor<B, 3>> {
+        device: &burn::tensor::Device,
+    ) -> Result<burn::tensor::Tensor<3>> {
         let frames = self.extract_frames(samples)?;
         let shape = [1, frames.len(), self.feature_dim()];
         let data = burn::tensor::TensorData::new(frames.concat(), shape);
@@ -326,8 +326,6 @@ fn compute_deltas(features: &[[f32; NUM_CEPSTRAL]]) -> Vec<[f32; NUM_CEPSTRAL]> 
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::ndarray::NdArrayDevice;
-    use burn::backend::NdArray;
 
     use super::*;
 
@@ -429,12 +427,10 @@ mod tests {
     #[test]
     fn test_extract_tensor_shape() {
         let samples = sine_wave(SAMPLE_RATE);
-        let device = NdArrayDevice::default();
+        let device = burn::tensor::Device::default();
         for mode in [FeatureMode::Mfcc39, FeatureMode::LogMel80] {
             let extractor = MfccExtractor::with_mode(mode);
-            let tensor = extractor
-                .extract_tensor::<NdArray<f32>>(&samples, &device)
-                .expect("tensor");
+            let tensor = extractor.extract_tensor(&samples, &device).expect("tensor");
             let num_frames = extractor.extract_frames(&samples).expect("frames").len();
             assert_eq!(tensor.dims(), [1, num_frames, mode.feature_dim()]);
         }

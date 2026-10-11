@@ -1,16 +1,14 @@
 //! Saving and loading module weights.
 //!
-//! Checkpoints are Burn records in full precision, written with
-//! `BinBytesRecorder`. Model hyperparameters are stored separately as JSON
-//! (`model-config.json`) next to the weights, so a checkpoint can be loaded
-//! without knowing how it was configured.
+//! Checkpoints are burnpack files (`.bpk`, appended when the path has no
+//! extension), written with Burn's `ModuleRecord`. Model hyperparameters are
+//! stored separately as JSON (`model-config.json`) next to the weights, so a
+//! checkpoint can be loaded without knowing how it was configured.
 
 use std::path::{Path, PathBuf};
 
-use burn::module::{Module, ModuleVisitor, Param};
-use burn::record::{BinBytesRecorder, FullPrecisionSettings, Recorder};
-use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
+use burn::module::Module;
+use burn::store::ModuleRecord;
 
 use crate::error::{self, Error, Result};
 use crate::mfcc::FeatureMode;
@@ -18,58 +16,44 @@ use crate::model::SpeechAlignerConfig;
 
 const MODEL_CONFIG_FILE: &str = "model-config.json";
 
-/// Forces lazily-initialised parameters to materialise.
-struct Materialize;
-
-impl<B: Backend> ModuleVisitor<B> for Materialize {
-    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
-        let _ = param.val();
+/// The file a checkpoint saved at `path` is written to: `path` itself, or
+/// `path.bpk` when it has no extension.
+pub fn file_path(path: &Path) -> PathBuf {
+    if path.extension().is_some() {
+        path.to_path_buf()
+    } else {
+        path.with_extension("bpk")
     }
 }
 
-/// Serialize a module's weights to `path`.
-pub fn save<B: Backend, M: Module<B>>(module: &M, path: &Path) -> Result<()> {
-    // Burn initialises parameters on first use. Cloning a module that was
-    // never used would give the clone its own, different random weights, so
-    // materialise them before cloning.
-    module.visit(&mut Materialize);
-    let bytes = BinBytesRecorder::<FullPrecisionSettings>::default()
-        .record(module.clone().into_record(), ())
-        .map_err(|err| Error::checkpoint(path, err))?;
-    error::write(path, bytes)
+/// Serialize a module's weights to `path` and return the file written (see
+/// [`file_path`]).
+pub fn save<M: Module>(module: &M, path: &Path) -> Result<PathBuf> {
+    let file = file_path(path);
+    module
+        .clone()
+        .save_file(&file)
+        .map_err(|err| Error::checkpoint(&file, err))?;
+    Ok(file)
 }
 
 /// Load weights from `path` into an already-initialised module of the same
 /// shape. A checkpoint saved from a different architecture is an error.
-pub fn load<B: Backend, M: Module<B>>(module: M, path: &Path, device: &B::Device) -> Result<M> {
-    let bytes = std::fs::read(path).map_err(|err| Error::io(path, err))?;
-    let record = BinBytesRecorder::<FullPrecisionSettings>::default()
-        .load(bytes, device)
-        .map_err(|err| Error::checkpoint(path, err))?;
-    // Burn does not check shapes when loading a record; a mismatch would only
-    // surface as a panic in the first forward pass.
-    let expected = param_shapes(&module);
-    let loaded = module.load_record(record);
-    if param_shapes(&loaded) != expected {
-        return Err(Error::checkpoint(
+pub fn load<M: Module>(module: M, path: &Path) -> Result<M> {
+    let record = ModuleRecord::load(path).map_err(|err| {
+        Error::checkpoint(
             path,
-            "weights do not match the model architecture (check model-config.json)",
-        ));
-    }
-    Ok(loaded)
-}
-
-/// Shapes of all float parameters, in visiting order.
-fn param_shapes<B: Backend, M: Module<B>>(module: &M) -> Vec<Vec<usize>> {
-    struct Shapes(Vec<Vec<usize>>);
-    impl<B: Backend> ModuleVisitor<B> for Shapes {
-        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
-            self.0.push(param.val().dims().to_vec());
-        }
-    }
-    let mut shapes = Shapes(Vec::new());
-    module.visit(&mut shapes);
-    shapes.0
+            format!("{err} (checkpoints written before version 0.3 cannot be read)"),
+        )
+    })?;
+    module.try_load_record(record).map_err(|err| {
+        Error::checkpoint(
+            path,
+            format!(
+                "{err}; the weights do not match the model architecture (check model-config.json)"
+            ),
+        )
+    })
 }
 
 fn model_config_path(checkpoint: &Path) -> PathBuf {
@@ -125,8 +109,8 @@ pub fn model_config_for(
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::NdArray;
     use burn::nn::LinearConfig;
+    use burn::tensor::{Device, Tensor};
 
     use super::*;
 
@@ -141,34 +125,32 @@ mod tests {
     #[test]
     fn mismatched_architecture_is_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let device = Default::default();
+        let device = Device::default();
         let path = dir.path().join("lin");
-        save(&LinearConfig::new(3, 2).init::<NdArray>(&device), &path).expect("save");
-        let err = load(
-            LinearConfig::new(4, 2).init::<NdArray>(&device),
-            &path,
-            &device,
-        )
-        .expect_err("shape mismatch");
+        save(&LinearConfig::new(3, 2).init(&device), &path).expect("save");
+        let err = load(LinearConfig::new(4, 2).init(&device), &path).expect_err("shape mismatch");
+        assert!(matches!(err, Error::Checkpoint { .. }), "{err}");
+    }
+
+    #[test]
+    fn missing_checkpoint_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let module = LinearConfig::new(3, 2).init(&Device::default());
+        let err = load(module, &dir.path().join("absent")).expect_err("missing");
         assert!(matches!(err, Error::Checkpoint { .. }), "{err}");
     }
 
     #[test]
     fn roundtrip_of_never_used_module() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let device = Default::default();
-        let a = LinearConfig::new(3, 2).init::<NdArray>(&device);
+        let device = Device::default();
+        let a = LinearConfig::new(3, 2).init(&device);
         let path = dir.path().join("lin");
         save(&a, &path).expect("save");
-        let b = load(
-            LinearConfig::new(3, 2).init::<NdArray>(&device),
-            &path,
-            &device,
-        )
-        .expect("load");
-        let x = Tensor::<NdArray, 2>::ones([1, 3], &device);
-        let ya: Vec<f32> = a.forward(x.clone()).into_data().to_vec().unwrap();
-        let yb: Vec<f32> = b.forward(x).into_data().to_vec().unwrap();
+        let b = load(LinearConfig::new(3, 2).init(&device), &path).expect("load");
+        let x = Tensor::<2>::ones([1, 3], &device);
+        let ya: Vec<f32> = a.forward(x.clone()).into_data().try_to_vec().unwrap();
+        let yb: Vec<f32> = b.forward(x).into_data().try_to_vec().unwrap();
         assert_eq!(ya, yb);
     }
 }

@@ -12,10 +12,8 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use burn::tensor::backend::Backend;
-use burn::tensor::{Shape, Tensor, TensorData};
+use burn::tensor::{Device, Shape, Tensor, TensorData};
 
-use crate::backend::{self, InferBackend};
 use crate::checkpoint;
 use crate::data::{audio, so762};
 use crate::error::{Error, Result};
@@ -143,11 +141,11 @@ impl CtcFrames {
 }
 
 pub fn evaluate(config: &EvaluateConfig) -> Result<EvaluationReport> {
-    let device = backend::default_device();
+    let device = Device::default();
 
     let head = match &config.scoring_head {
         Some(path) => {
-            let (head, head_config) = ScoringHead::<InferBackend>::load(path, &device)?;
+            let (head, head_config) = ScoringHead::load(path, &device)?;
             if head_config.input_source != InputSource::Backbone {
                 return Err(Error::config(
                     "this scoring head reads teacher features; evaluate it with \
@@ -173,11 +171,7 @@ pub fn evaluate(config: &EvaluateConfig) -> Result<EvaluationReport> {
             )));
         }
     }
-    let model = checkpoint::load(
-        model_config.init::<InferBackend>(&device)?,
-        &config.checkpoint,
-        &device,
-    )?;
+    let model = checkpoint::load(model_config.init(&device)?, &config.checkpoint)?;
     let extractor = MfccExtractor::with_mode(feature_mode);
 
     let words = so762::load(&config.dataset, config.max_samples)?;
@@ -208,7 +202,7 @@ pub fn evaluate(config: &EvaluateConfig) -> Result<EvaluationReport> {
                 continue;
             }
         };
-        let input = Tensor::<InferBackend, 3>::from_data(
+        let input = Tensor::<3>::from_data(
             TensorData::new(
                 frames.concat(),
                 Shape::new([1, frames.len(), extractor.feature_dim()]),
@@ -299,9 +293,9 @@ pub fn evaluate(config: &EvaluateConfig) -> Result<EvaluationReport> {
 }
 
 /// `[frames, 1, classes]` CTC outputs → host vectors.
-fn ctc_frames<B: Backend>(log_probs: Tensor<B, 3>, logits: Tensor<B, 3>) -> CtcFrames {
+fn ctc_frames(log_probs: Tensor<3>, logits: Tensor<3>) -> CtcFrames {
     let [frames, _, classes] = log_probs.dims();
-    let to_vec = |t: Tensor<B, 3>| t.into_data().iter::<f32>().collect::<Vec<_>>();
+    let to_vec = |t: Tensor<3>| t.into_data().iter::<f32>().collect::<Vec<_>>();
     CtcFrames {
         log_probs: to_vec(log_probs),
         logits: to_vec(logits),

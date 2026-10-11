@@ -3,8 +3,7 @@
 use std::collections::BTreeMap;
 
 use burn::tensor::activation::{log_softmax, relu, sigmoid, softmax};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Shape, Tensor, TensorData};
+use burn::tensor::{Device, Shape, Tensor, TensorData};
 
 use crate::finetune::head::ScoreOutput;
 
@@ -24,17 +23,12 @@ pub fn ordinal_bin(raw_score: i32) -> usize {
     }
 }
 
-fn row<B: Backend>(values: Vec<f32>, device: &B::Device) -> Tensor<B, 2> {
+fn row(values: Vec<f32>, device: &Device) -> Tensor<2> {
     let n = values.len();
     Tensor::from_data(TensorData::new(values, Shape::new([1, n])), device)
 }
 
-fn matrix<B: Backend>(
-    values: Vec<f32>,
-    rows: usize,
-    cols: usize,
-    device: &B::Device,
-) -> Tensor<B, 2> {
+fn matrix(values: Vec<f32>, rows: usize, cols: usize, device: &Device) -> Tensor<2> {
     Tensor::from_data(TensorData::new(values, Shape::new([rows, cols])), device)
 }
 
@@ -47,12 +41,12 @@ fn threshold_logits() -> Vec<f32> {
 
 /// Bin probabilities `[words, 5]` for the cumulative-threshold model, where
 /// logit `k` is the log-odds that the score exceeds threshold `k`.
-fn ordinal_bin_probs<B: Backend>(logits: Tensor<B, 2>) -> Tensor<B, 2> {
+fn ordinal_bin_probs(logits: Tensor<2>) -> Tensor<2> {
     let [words, _] = logits.dims();
     let device = logits.device();
     let exceed = sigmoid(logits - row(threshold_logits(), &device));
-    let ones = Tensor::<B, 2>::ones([words, 1], &device);
-    let zeros = Tensor::<B, 2>::zeros([words, 1], &device);
+    let ones = Tensor::<2>::ones([words, 1], &device);
+    let zeros = Tensor::<2>::zeros([words, 1], &device);
     // P(bin k) = P(score > t_{k-1}) − P(score > t_k), with P(> t_{-1}) = 1, P(> t_4) = 0.
     let upper = Tensor::cat(vec![ones, exceed.clone()], 1);
     let lower = Tensor::cat(vec![exceed, zeros], 1);
@@ -60,7 +54,7 @@ fn ordinal_bin_probs<B: Backend>(logits: Tensor<B, 2>) -> Tensor<B, 2> {
 }
 
 /// Expected score in `[0, 1]` for the ordinal head outputs.
-pub fn ordinal_predictions<B: Backend>(logits: Tensor<B, 2>, output: ScoreOutput) -> Tensor<B, 1> {
+pub fn ordinal_predictions(logits: Tensor<2>, output: ScoreOutput) -> Tensor<1> {
     let [words, _] = logits.dims();
     let device = logits.device();
     let probs = match output {
@@ -75,11 +69,11 @@ pub fn ordinal_predictions<B: Backend>(logits: Tensor<B, 2>, output: ScoreOutput
 
 /// Weighted binary cross-entropy on the four "score exceeds threshold"
 /// targets.
-pub fn ordinal_threshold_loss<B: Backend>(
-    logits: Tensor<B, 2>,
+pub fn ordinal_threshold_loss(
+    logits: Tensor<2>,
     raw_scores: &[i32],
-    weights: Tensor<B, 1>,
-) -> Tensor<B, 1> {
+    weights: Tensor<1>,
+) -> Tensor<1> {
     let words = raw_scores.len();
     let device = logits.device();
     let targets: Vec<f32> = raw_scores
@@ -94,11 +88,11 @@ pub fn ordinal_threshold_loss<B: Backend>(
 }
 
 /// Weighted 5-way cross-entropy over score bins.
-pub fn ordinal_softmax_loss<B: Backend>(
-    logits: Tensor<B, 2>,
+pub fn ordinal_softmax_loss(
+    logits: Tensor<2>,
     raw_scores: &[i32],
-    weights: Tensor<B, 1>,
-) -> Tensor<B, 1> {
+    weights: Tensor<1>,
+) -> Tensor<1> {
     let words = raw_scores.len();
     let device = logits.device();
     let mut one_hot = vec![0.0f32; words * 5];
@@ -113,12 +107,12 @@ pub fn ordinal_softmax_loss<B: Backend>(
 
 /// Squared error weighted by `(1 − p_t)^gamma`, where `p_t = 1 − |error|`, so
 /// words with large errors count more.
-pub fn focal_mse<B: Backend>(
-    predicted: Tensor<B, 1>,
-    targets: Tensor<B, 1>,
-    weights: Tensor<B, 1>,
+pub fn focal_mse(
+    predicted: Tensor<1>,
+    targets: Tensor<1>,
+    weights: Tensor<1>,
     gamma: f32,
-) -> Tensor<B, 1> {
+) -> Tensor<1> {
     let error = predicted - targets;
     let focal = error.clone().abs().clamp_max(1.0).powf_scalar(gamma);
     (error.clone() * error * focal * weights).mean()
@@ -128,12 +122,12 @@ pub fn focal_mse<B: Backend>(
 /// prediction as a Gaussian with `noise_sigma` and classifies it against
 /// every target in the batch. Targets with the same raw score count as
 /// positives.
-pub fn balanced_mse<B: Backend>(
-    predicted: Tensor<B, 1>,
-    targets: Tensor<B, 1>,
+pub fn balanced_mse(
+    predicted: Tensor<1>,
+    targets: Tensor<1>,
     raw_scores: &[i32],
     noise_sigma: f32,
-) -> Tensor<B, 1> {
+) -> Tensor<1> {
     let words = raw_scores.len();
     if words < 2 {
         let error = predicted - targets;
@@ -159,11 +153,7 @@ pub fn balanced_mse<B: Backend>(
 
 /// Hinge loss over every pair whose human scores differ: the higher-scored
 /// word should be predicted at least `margin` higher.
-pub fn pairwise_ranking<B: Backend>(
-    predicted: Tensor<B, 1>,
-    raw_scores: &[i32],
-    margin: f32,
-) -> Tensor<B, 1> {
+pub fn pairwise_ranking(predicted: Tensor<1>, raw_scores: &[i32], margin: f32) -> Tensor<1> {
     let words = raw_scores.len();
     let device = predicted.device();
     let mask: Vec<f32> = raw_scores
@@ -189,11 +179,7 @@ pub fn pairwise_ranking<B: Backend>(
 /// Triplet loss on pooled word embeddings. For each anchor, words within 1
 /// raw point are positives and words 3+ points away are negatives; the mean
 /// positive distance should be `margin` below the mean negative distance.
-pub fn triplet_ranking<B: Backend>(
-    pooled: Tensor<B, 2>,
-    raw_scores: &[i32],
-    margin: f32,
-) -> Tensor<B, 1> {
+pub fn triplet_ranking(pooled: Tensor<2>, raw_scores: &[i32], margin: f32) -> Tensor<1> {
     let [words, dim] = pooled.dims();
     let device = pooled.device();
     let diff = pooled.clone().reshape([words, 1, dim]) - pooled.reshape([1, words, dim]);
@@ -242,11 +228,7 @@ pub fn triplet_ranking<B: Backend>(
 /// The runs in the experiment log used the *mean* squared distance per
 /// dimension, which kept embedding similarity within `[0.992, 1]` and gave
 /// almost no gradient. This version uses the sum.
-pub fn rank_regularization<B: Backend>(
-    pooled: Tensor<B, 2>,
-    targets: Tensor<B, 1>,
-    tau: f32,
-) -> Tensor<B, 1> {
+pub fn rank_regularization(pooled: Tensor<2>, targets: Tensor<1>, tau: f32) -> Tensor<1> {
     let [words, dim] = pooled.dims();
     let device = pooled.device();
     if words < 2 {
@@ -306,15 +288,12 @@ pub fn effective_number_weights(counts: &BTreeMap<i32, usize>, beta: f32) -> BTr
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::NdArray;
 
     use super::*;
     use crate::finetune::head::scalar;
 
-    type B = NdArray;
-
-    fn t1(values: &[f32]) -> Tensor<B, 1> {
-        Tensor::from_data(TensorData::from(values), &Default::default())
+    fn t1(values: &[f32]) -> Tensor<1> {
+        Tensor::from_data(TensorData::from(values), &Device::default())
     }
 
     #[test]
@@ -325,9 +304,9 @@ mod tests {
 
     #[test]
     fn ordinal_predictions_are_expected_scores() {
-        let device = Default::default();
+        let device = Device::default();
         let neutral = |output: ScoreOutput, n| {
-            let p = ordinal_predictions(Tensor::<B, 2>::zeros([1, n], &device), output);
+            let p = ordinal_predictions(Tensor::<2>::zeros([1, n], &device), output);
             scalar(p)
         };
         // Threshold model at zero logits: bins weighted by threshold distances.
@@ -350,24 +329,24 @@ mod tests {
 
     #[test]
     fn triplet_ranking_is_zero_when_positives_are_closer() {
-        let pooled = Tensor::<B, 2>::from_data(
+        let pooled = Tensor::<2>::from_data(
             TensorData::new(vec![1.0f32, 0.0, 1.1, 0.0, 4.0, 0.0], Shape::new([3, 2])),
-            &Default::default(),
+            &Device::default(),
         );
         assert!(scalar(triplet_ranking(pooled, &[10, 9, 2], 0.1)) < 1e-6);
     }
 
     #[test]
     fn rank_regularization_has_usable_range() {
-        let device = Default::default();
+        let device = Device::default();
         // Orthogonal embeddings for identical scores: large loss.
-        let orthogonal = Tensor::<B, 2>::from_data(
+        let orthogonal = Tensor::<2>::from_data(
             TensorData::new(vec![1.0f32, 0.0, 0.0, 1.0], Shape::new([2, 2])),
             &device,
         );
         let mismatched = scalar(rank_regularization(orthogonal, t1(&[1.0, 1.0]), 0.15));
         // Parallel embeddings for identical scores: no loss.
-        let parallel = Tensor::<B, 2>::ones([2, 2], &device);
+        let parallel = Tensor::<2>::ones([2, 2], &device);
         let matched = scalar(rank_regularization(parallel, t1(&[1.0, 1.0]), 0.15));
         assert!(matched < 1e-6);
         assert!(mismatched > 0.5, "got {mismatched}");

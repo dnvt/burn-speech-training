@@ -8,17 +8,15 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use burn::module::{AutodiffModule, Module};
+use burn::module::Module;
 use burn::nn::loss::CTCLossConfig;
-use burn::optim::{AdamConfig, GradientsParams, Optimizer};
-use burn::tensor::backend::Backend;
-use burn::tensor::ElementConversion;
+use burn::optim::{AdamConfig, GradientsParams};
+use burn::tensor::Device;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde_json::{json, Value};
 
-use crate::backend::{self, TrainBackend};
 use crate::checkpoint;
 use crate::data::batch::{collate, plan_batches};
 use crate::data::{Batching, TrainingSample};
@@ -95,12 +93,11 @@ pub(crate) fn learning_rate_at(base: f64, epoch: usize, total: usize, warmup: us
 /// `config.checkpoint_dir`.
 pub fn train(mut samples: Vec<TrainingSample>, config: &TrainConfig) -> Result<TrainSummary> {
     validate(&samples, config)?;
-    let device = backend::default_device();
-
-    TrainBackend::seed(&device, config.seed);
-    let mut model: SpeechAligner<TrainBackend> = config.model.init(&device)?;
+    let device = Device::default().autodiff();
+    device.seed(config.seed);
+    let mut model: SpeechAligner = config.model.init(&device)?;
     if let Some(path) = &config.resume_from {
-        model = checkpoint::load(model, path, &device)?;
+        model = checkpoint::load(model, path)?;
         tracing::info!("resumed from {}", path.display());
     }
     let num_params = model.num_params();
@@ -121,15 +118,14 @@ pub fn train(mut samples: Vec<TrainingSample>, config: &TrainConfig) -> Result<T
 
     let plan = plan_batches(&mut samples, config.batching, config.model.n_heads);
     tracing::info!(
-        "training {num_params} params on {} samples in {} batches, {} epochs, backend {}",
+        "training {num_params} params on {} samples in {} batches, {} epochs, {device:?}",
         samples.len(),
         plan.len(),
         config.epochs,
-        backend::BACKEND_NAME
     );
 
     let ctc = CTCLossConfig::new().with_zero_infinity(true).init();
-    let mut optimizer = AdamConfig::new().init::<TrainBackend, SpeechAligner<TrainBackend>>();
+    let mut optimizer = AdamConfig::new().init();
     // Offset by completed epochs so a resumed run doesn't replay the batch
     // order of the first run.
     let mut rng = StdRng::seed_from_u64(config.seed + resume.completed_epochs as u64);
@@ -151,7 +147,7 @@ pub fn train(mut samples: Vec<TrainingSample>, config: &TrainConfig) -> Result<T
         let (mut loss_sum, mut samples_seen, mut skipped) = (0.0f64, 0usize, 0usize);
         for (step, &batch_idx) in order.iter().enumerate() {
             let batch_samples = &samples[plan[batch_idx].clone()];
-            let batch = collate::<TrainBackend>(batch_samples, &device);
+            let batch = collate(batch_samples, &device);
             let output = model.forward_with_pad_mask(batch.inputs, batch.pad_mask);
             let loss = ctc
                 .forward(
@@ -161,7 +157,7 @@ pub fn train(mut samples: Vec<TrainingSample>, config: &TrainConfig) -> Result<T
                     batch.target_lengths,
                 )
                 .mean();
-            let loss_value: f32 = loss.clone().into_scalar().elem();
+            let loss_value = loss.clone().into_scalar::<f32>();
 
             if loss_value.is_finite() {
                 let grads = GradientsParams::from_grads(loss.backward(), &model);
@@ -217,8 +213,10 @@ pub fn train(mut samples: Vec<TrainingSample>, config: &TrainConfig) -> Result<T
         return Err(Error::training("every batch produced a non-finite loss"));
     }
 
-    let final_checkpoint = config.checkpoint_dir.join(FINAL_CHECKPOINT);
-    checkpoint::save(&model.valid(), &final_checkpoint)?;
+    let final_checkpoint = checkpoint::save(
+        &model.valid(),
+        &config.checkpoint_dir.join(FINAL_CHECKPOINT),
+    )?;
     metrics.log(
         "complete",
         json!({ "epochs": resume.completed_epochs + config.epochs }),
@@ -262,7 +260,7 @@ struct ResumeState {
 }
 
 fn checkpoint_epoch(path: &Path) -> Option<usize> {
-    path.file_name()?
+    path.file_stem()?
         .to_str()?
         .strip_prefix(EPOCH_CHECKPOINT_PREFIX)?
         .parse()
@@ -392,9 +390,9 @@ mod tests {
         let last = *summary.epoch_losses.last().expect("losses");
         assert!(last < first, "loss should fall: {first} -> {last}");
         for name in [
-            "speech-aligner-epoch-4",
-            "speech-aligner-epoch-8",
-            FINAL_CHECKPOINT,
+            "speech-aligner-epoch-4.bpk",
+            "speech-aligner-epoch-8.bpk",
+            "speech-aligner-final.bpk",
             METRICS_FILE,
             "model-config.json",
         ] {
@@ -402,11 +400,8 @@ mod tests {
         }
 
         // The final checkpoint loads back into the same architecture.
-        let device = backend::default_device();
-        let model = tiny_model()
-            .init::<backend::InferBackend>(&device)
-            .expect("init");
-        checkpoint::load(model, &summary.final_checkpoint, &device).expect("reload");
+        let model = tiny_model().init(&Device::default()).expect("init");
+        checkpoint::load(model, &summary.final_checkpoint).expect("reload");
     }
 
     #[test]
@@ -449,7 +444,7 @@ mod tests {
             ),
         )
         .expect("write metrics");
-        std::fs::write(dir.path().join("speech-aligner-epoch-3"), b"").expect("write");
+        std::fs::write(dir.path().join("speech-aligner-epoch-3.bpk"), b"").expect("write");
 
         let state =
             collect_resume_state(Some(&dir.path().join("speech-aligner-epoch-2"))).expect("state");
@@ -465,7 +460,7 @@ mod tests {
     #[test]
     fn resume_state_falls_back_to_newest_epoch() {
         let dir = tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("speech-aligner-epoch-3"), b"").expect("write");
+        std::fs::write(dir.path().join("speech-aligner-epoch-3.bpk"), b"").expect("write");
         let state = collect_resume_state(Some(&dir.path().join(FINAL_CHECKPOINT))).expect("state");
         assert_eq!(state.completed_epochs, 3);
     }
@@ -473,7 +468,7 @@ mod tests {
     #[test]
     fn fresh_run_ignores_old_checkpoints() {
         let dir = tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("speech-aligner-epoch-7"), b"").expect("write");
+        std::fs::write(dir.path().join("speech-aligner-epoch-7.bpk"), b"").expect("write");
         assert_eq!(
             collect_resume_state(None).expect("state"),
             ResumeState::default()

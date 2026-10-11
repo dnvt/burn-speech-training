@@ -9,9 +9,8 @@
 //! ```
 
 use burn::module::Module;
-use burn::tensor::{Shape, Tensor, TensorData};
+use burn::tensor::{Device, Shape, Tensor, TensorData};
 
-use burn_speech_training::backend::{default_device, InferBackend};
 use burn_speech_training::checkpoint;
 use burn_speech_training::data::{Batching, TrainingSample};
 use burn_speech_training::error::Result;
@@ -54,14 +53,10 @@ fn main() -> Result<()> {
     }
 
     // Reload the final checkpoint and run it on a new utterance.
-    let device = default_device();
-    let trained = checkpoint::load(
-        model.init::<InferBackend>(&device)?,
-        &summary.final_checkpoint,
-        &device,
-    )?;
+    let device = Device::default();
+    let trained = checkpoint::load(model.init(&device)?, &summary.final_checkpoint)?;
     let sample = synthetic_sample(40, 99);
-    let input = Tensor::<InferBackend, 3>::from_data(
+    let input = Tensor::<3>::from_data(
         TensorData::new(sample.features, Shape::new([1, 40, FEATURE_DIM])),
         &device,
     );

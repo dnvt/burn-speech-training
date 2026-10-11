@@ -3,18 +3,17 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use burn::module::AutodiffModule;
+use burn::module::Module;
 use burn::nn::loss::CTCLossConfig;
 use burn::nn::{Linear, LinearConfig};
-use burn::optim::{AdamConfig, GradientsParams, Optimizer};
-use burn::tensor::Tensor;
+use burn::optim::{AdamConfig, GradientsParams};
+use burn::tensor::{Device, Tensor};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{RngExt, SeedableRng};
 
 use super::losses::{self, ordinal_bin};
 use super::teacher::{self, TeacherCache, TeacherFeatures, TEACHER_DIM};
-use crate::backend::{self, TrainBackend};
 use crate::checkpoint;
 use crate::data::batch::collate;
 use crate::data::TrainingSample;
@@ -22,11 +21,9 @@ use crate::error::{self, Error, Result};
 use crate::finetune::head::{self, InputSource, Pooling, ScoreOutput};
 use crate::finetune::{
     self as core, backbone_features, correlate, log_epoch, pool_words, save_pair, tensor_1d,
-    EpochStats, FineTuneConfig, FineTuneSummary, ScoredUtterance, ScoringHead, ScoringHeadConfig,
-    WordBatch,
+    EpochStats, FineTuneConfig, FineTuneSummary, ScoredUtterance, ScoringHeadConfig, WordBatch,
 };
 use crate::metrics::MetricsWriter;
-use crate::model::SpeechAligner;
 use crate::stats::Correlation;
 use crate::train::learning_rate_at;
 
@@ -222,7 +219,7 @@ fn reweight(utterances: &mut [ScoredUtterance], config: &ExperimentConfig) {
 }
 
 /// Append mixed copies of low-scored words to the batch.
-fn mixup(batch: &mut WordBatch<TrainBackend>, alpha: f32, below: i32, rng: &mut StdRng) {
+fn mixup(batch: &mut WordBatch, alpha: f32, below: i32, rng: &mut StdRng) {
     let n = batch.targets.len();
     if n < 2 {
         return;
@@ -256,7 +253,7 @@ fn mixup(batch: &mut WordBatch<TrainBackend>, alpha: f32, below: i32, rng: &mut 
 pub fn finetune(config: &ExperimentConfig) -> Result<FineTuneSummary> {
     config.validate()?;
     let base = &config.base;
-    let device = backend::default_device();
+    let device = Device::default().autodiff();
     let teacher_input = config.teacher_input();
     let ctc_weight = if teacher_input { 0.0 } else { base.ctc_weight };
     let freeze_backbone = teacher_input || config.freeze_backbone;
@@ -313,8 +310,8 @@ pub fn finetune(config: &ExperimentConfig) -> Result<FineTuneSummary> {
             base.head_hidden_dim,
         )
     };
-    let mut head = head_config.init::<TrainBackend>(&device);
-    let mut projection: Option<Linear<TrainBackend>> = match &config.teacher {
+    let mut head = head_config.init(&device);
+    let mut projection: Option<Linear> = match &config.teacher {
         Some((_, TeacherMode::Distill { .. })) => {
             Some(LinearConfig::new(TEACHER_DIM, dim).init(&device))
         }
@@ -331,9 +328,9 @@ pub fn finetune(config: &ExperimentConfig) -> Result<FineTuneSummary> {
         items.chunks(base.batch_size).collect();
     let mut rng = StdRng::seed_from_u64(base.seed);
     let ctc = CTCLossConfig::new().with_zero_infinity(true).init();
-    let mut model_optimizer = AdamConfig::new().init::<TrainBackend, SpeechAligner<TrainBackend>>();
-    let mut head_optimizer = AdamConfig::new().init::<TrainBackend, ScoringHead<TrainBackend>>();
-    let mut projection_optimizer = AdamConfig::new().init::<TrainBackend, Linear<TrainBackend>>();
+    let mut model_optimizer = AdamConfig::new().init();
+    let mut head_optimizer = AdamConfig::new().init();
+    let mut projection_optimizer = AdamConfig::new().init();
 
     let mut epochs = Vec::with_capacity(base.epochs);
     let mut best: Option<(usize, Correlation, std::path::PathBuf, std::path::PathBuf)> = None;
@@ -355,7 +352,7 @@ pub fn finetune(config: &ExperimentConfig) -> Result<FineTuneSummary> {
             let refs: Vec<&ScoredUtterance> = batch.iter().map(|(u, _)| u).collect();
             let output = (!teacher_input).then(|| {
                 let samples: Vec<TrainingSample> = refs.iter().map(|u| u.sample.clone()).collect();
-                let b = collate::<TrainBackend>(&samples, &device);
+                let b = collate(&samples, &device);
                 let output = model.forward_with_pad_mask(b.inputs, b.pad_mask);
                 (output, b.targets, b.input_lengths, b.target_lengths)
             });
@@ -438,7 +435,7 @@ pub fn finetune(config: &ExperimentConfig) -> Result<FineTuneSummary> {
             if let (Some(proj), Some((_, TeacherMode::Distill { weight }))) =
                 (&projection, &config.teacher)
             {
-                let parts: Vec<Tensor<TrainBackend, 1>> = batch
+                let parts: Vec<Tensor<1>> = batch
                     .iter()
                     .enumerate()
                     .filter_map(|(i, (_, f))| {
@@ -612,11 +609,9 @@ mod tests {
             ..ExperimentConfig::new(base(dir.path()))
         };
         let summary = finetune(&config).expect("finetune");
-        let (_, head_config) = ScoringHead::<crate::backend::InferBackend>::load(
-            &summary.final_head,
-            &backend::default_device(),
-        )
-        .expect("load");
+        let (_, head_config) =
+            crate::finetune::ScoringHead::load(&summary.final_head, &Device::default())
+                .expect("load");
         assert_eq!(head_config.output, ScoreOutput::OrdinalSoftmax);
     }
 }

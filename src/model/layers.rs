@@ -8,25 +8,24 @@ use burn::nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig
 use burn::nn::conv::{Conv1d, Conv1dConfig};
 use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig1d};
 use burn::tensor::activation::{relu, sigmoid};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Bool, Tensor};
+use burn::tensor::{Bool, Device, Tensor};
 
 /// Conv1d (same padding) -> `LayerNorm` over channels -> `ReLU` ->
 /// squeeze-and-excitation, on `[batch, channels, time]`.
 #[derive(Module, Debug)]
-pub struct ConvSEBlock<B: Backend> {
-    conv: Conv1d<B>,
-    ln: LayerNorm<B>,
-    se: SEBlock<B>,
+pub struct ConvSEBlock {
+    conv: Conv1d,
+    ln: LayerNorm,
+    se: SEBlock,
 }
 
-impl<B: Backend> ConvSEBlock<B> {
+impl ConvSEBlock {
     pub(super) fn new(
         in_channels: usize,
         out_channels: usize,
         kernel_size: usize,
         se_reduction: usize,
-        device: &B::Device,
+        device: &Device,
     ) -> Self {
         Self {
             conv: Conv1dConfig::new(in_channels, out_channels, kernel_size)
@@ -39,7 +38,7 @@ impl<B: Backend> ConvSEBlock<B> {
 
     /// Padded frames leave the block zeroed so the next convolution sees the
     /// same zero context as at the end of an unpadded utterance.
-    pub(super) fn forward(&self, x: Tensor<B, 3>, keep: Option<&Tensor<B, 3>>) -> Tensor<B, 3> {
+    pub(super) fn forward(&self, x: Tensor<3>, keep: Option<&Tensor<3>>) -> Tensor<3> {
         let x = self.conv.forward(x);
         let x = self.ln.forward(x.swap_dims(1, 2)).swap_dims(1, 2);
         let mut x = relu(x);
@@ -54,13 +53,13 @@ impl<B: Backend> ConvSEBlock<B> {
 /// `channels -> channels / reduction -> channels` bottleneck, and a sigmoid
 /// gate that rescales each channel.
 #[derive(Module, Debug)]
-pub struct SEBlock<B: Backend> {
-    fc_squeeze: Linear<B>,
-    fc_excite: Linear<B>,
+pub struct SEBlock {
+    fc_squeeze: Linear,
+    fc_excite: Linear,
 }
 
-impl<B: Backend> SEBlock<B> {
-    pub(super) fn new(channels: usize, reduction: usize, device: &B::Device) -> Self {
+impl SEBlock {
+    pub(super) fn new(channels: usize, reduction: usize, device: &Device) -> Self {
         let bottleneck = (channels / reduction.max(1)).max(1);
         Self {
             fc_squeeze: LinearConfig::new(channels, bottleneck).init(device),
@@ -70,7 +69,7 @@ impl<B: Backend> SEBlock<B> {
 
     /// With `keep`, `x` must already be zero at padded frames; the mean then
     /// covers real frames only.
-    pub(super) fn forward(&self, x: Tensor<B, 3>, keep: Option<&Tensor<B, 3>>) -> Tensor<B, 3> {
+    pub(super) fn forward(&self, x: Tensor<3>, keep: Option<&Tensor<3>>) -> Tensor<3> {
         let [batch, channels, _] = x.dims();
         let pooled = match keep {
             Some(keep) => x.clone().sum_dim(2) / keep.clone().sum_dim(2).clamp_min(1.0),
@@ -85,13 +84,13 @@ impl<B: Backend> SEBlock<B> {
 /// Pre-norm multi-head self-attention with a residual connection and no
 /// dropout, on `[batch, time, d_model]`.
 #[derive(Module, Debug)]
-pub struct SelfAttentionLayer<B: Backend> {
-    layer_norm: LayerNorm<B>,
-    mha: MultiHeadAttention<B>,
+pub struct SelfAttentionLayer {
+    layer_norm: LayerNorm,
+    mha: MultiHeadAttention,
 }
 
-impl<B: Backend> SelfAttentionLayer<B> {
-    pub(super) fn new(d_model: usize, n_heads: usize, device: &B::Device) -> Self {
+impl SelfAttentionLayer {
+    pub(super) fn new(d_model: usize, n_heads: usize, device: &Device) -> Self {
         Self {
             layer_norm: LayerNormConfig::new(d_model).init(device),
             mha: MultiHeadAttentionConfig::new(d_model, n_heads)
@@ -100,11 +99,7 @@ impl<B: Backend> SelfAttentionLayer<B> {
         }
     }
 
-    pub(super) fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        mask_pad: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
+    pub(super) fn forward(&self, x: Tensor<3>, mask_pad: Option<Tensor<2, Bool>>) -> Tensor<3> {
         let mut input = MhaInput::self_attn(self.layer_norm.forward(x.clone()));
         if let Some(mask_pad) = mask_pad {
             input = input.mask_pad(mask_pad);

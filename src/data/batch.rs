@@ -2,8 +2,7 @@
 
 use std::ops::Range;
 
-use burn::tensor::backend::Backend;
-use burn::tensor::{Bool, Int, Shape, Tensor, TensorData};
+use burn::tensor::{Bool, Device, Int, Shape, Tensor, TensorData};
 
 /// One utterance: feature frames and CTC targets.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,17 +32,17 @@ impl TrainingSample {
 }
 
 /// A padded batch on a device.
-pub struct Batch<B: Backend> {
+pub struct Batch {
     /// `[batch, max_frames, feature_dim]`, zero-padded.
-    pub inputs: Tensor<B, 3>,
+    pub inputs: Tensor<3>,
     /// `[batch, max_targets]`, zero-padded.
-    pub targets: Tensor<B, 2, Int>,
+    pub targets: Tensor<2, Int>,
     /// `[batch]`
-    pub input_lengths: Tensor<B, 1, Int>,
+    pub input_lengths: Tensor<1, Int>,
     /// `[batch]`
-    pub target_lengths: Tensor<B, 1, Int>,
+    pub target_lengths: Tensor<1, Int>,
     /// `[batch, max_frames]`, `true` on padded frames.
-    pub pad_mask: Tensor<B, 2, Bool>,
+    pub pad_mask: Tensor<2, Bool>,
 }
 
 /// How samples are grouped into batches.
@@ -123,7 +122,7 @@ pub fn plan_batches(
 }
 
 /// Pad and stack samples into a batch. All samples must share `feature_dim`.
-pub fn collate<B: Backend>(samples: &[TrainingSample], device: &B::Device) -> Batch<B> {
+pub fn collate(samples: &[TrainingSample], device: &Device) -> Batch {
     let batch = samples.len();
     let feature_dim = samples.first().map_or(0, |s| s.feature_dim);
     let max_frames = samples
@@ -180,7 +179,6 @@ pub fn collate<B: Backend>(samples: &[TrainingSample], device: &B::Device) -> Ba
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::NdArray;
 
     use super::*;
 
@@ -244,7 +242,7 @@ mod tests {
     #[test]
     fn collate_pads_and_masks() {
         let samples = [sample(3), sample(5)];
-        let batch = collate::<NdArray>(&samples, &Default::default());
+        let batch = collate(&samples, &Device::default());
 
         assert_eq!(batch.inputs.dims(), [2, 5, 2]);
         assert_eq!(batch.targets.dims(), [2, 1]);
@@ -253,17 +251,17 @@ mod tests {
             .input_lengths
             .into_data()
             .convert::<i64>()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
         assert_eq!(lengths, [3, 5]);
 
-        let mask: Vec<bool> = batch.pad_mask.into_data().to_vec().unwrap();
+        let mask: Vec<bool> = batch.pad_mask.into_data().try_to_vec().unwrap();
         assert_eq!(
             mask,
             [false, false, false, true, true, false, false, false, false, false]
         );
 
-        let inputs: Vec<f32> = batch.inputs.into_data().to_vec().unwrap();
+        let inputs: Vec<f32> = batch.inputs.into_data().try_to_vec().unwrap();
         // First sample: 3 real frames then zero padding.
         assert_eq!(&inputs[..6], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(&inputs[6..10], &[0.0; 4]);

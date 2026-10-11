@@ -16,7 +16,7 @@ result is ρ = 0.29 (see [Results](#results)).
 
 ## Quick start
 
-Needs Rust 1.92 or newer.
+Needs Rust 1.95 or newer.
 
 ```bash
 git clone https://github.com/dnvt/burn-speech-training
@@ -159,15 +159,16 @@ reproduction.
 
 | Feature | Default | |
 |---|---|---|
-| `ndarray` | yes | CPU backend; the one tested in CI |
+| `flex` | yes | pure-Rust CPU backend; the one tested in CI |
 | `cli` | yes | the `burn-speech` binary |
 | `wgpu` | | GPU via Vulkan/Metal/DX12 (compiled in CI, not run) |
 | `cuda` | | NVIDIA GPU (not tested in CI) |
 | `experiments` | | variants from the experiment log |
 
-When several backends are enabled, `cuda` wins over `wgpu`, which wins over
-`ndarray`. To use the library without the CLI:
-`default-features = false, features = ["ndarray"]`.
+Several backends can be compiled in. The default device is the first
+available of `cuda`, `wgpu` and `flex`; set `BURN_DEVICE` (e.g.
+`BURN_DEVICE=flex`) to pick one. To use the library without the CLI:
+`default-features = false, features = ["flex"]`.
 
 ## Layout
 

@@ -9,8 +9,7 @@ use std::path::{Path, PathBuf};
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::{relu, sigmoid};
-use burn::tensor::backend::Backend;
-use burn::tensor::{ElementConversion, Tensor};
+use burn::tensor::{Device, Tensor};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpoint;
@@ -97,7 +96,7 @@ impl ScoringHeadConfig {
         }
     }
 
-    pub fn init<B: Backend>(&self, device: &B::Device) -> ScoringHead<B> {
+    pub fn init(&self, device: &Device) -> ScoringHead {
         let attention_pool = match self.pooling {
             Pooling::Mean => None,
             #[cfg(feature = "experiments")]
@@ -135,22 +134,22 @@ fn config_path(head_checkpoint: &Path) -> PathBuf {
 }
 
 #[derive(Module, Debug)]
-pub struct ScoringHead<B: Backend> {
-    hidden: Linear<B>,
-    output: Linear<B>,
-    attention_pool: Option<Linear<B>>,
+pub struct ScoringHead {
+    hidden: Linear,
+    output: Linear,
+    attention_pool: Option<Linear>,
 }
 
-impl<B: Backend> ScoringHead<B> {
+impl ScoringHead {
     /// Load a head checkpoint together with its config.
-    pub fn load(path: &Path, device: &B::Device) -> Result<(Self, ScoringHeadConfig)> {
+    pub fn load(path: &Path, device: &Device) -> Result<(Self, ScoringHeadConfig)> {
         let config = ScoringHeadConfig::load_for(path)?;
-        let head = checkpoint::load(config.init(device), path, device)?;
+        let head = checkpoint::load(config.init(device), path)?;
         Ok((head, config))
     }
 
     /// `[frames, dim]` → `[1, dim]`.
-    pub fn pool(&self, span: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn pool(&self, span: Tensor<2>) -> Tensor<2> {
         let [frames, dim] = span.dims();
         match &self.attention_pool {
             None => span.mean_dim(0),
@@ -166,7 +165,7 @@ impl<B: Backend> ScoringHead<B> {
     }
 
     /// `[words, input_dim]` → `[words, num_logits]`.
-    pub fn forward(&self, pooled: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward(&self, pooled: Tensor<2>) -> Tensor<2> {
         self.output.forward(relu(self.hidden.forward(pooled)))
     }
 
@@ -175,7 +174,7 @@ impl<B: Backend> ScoringHead<B> {
     /// frame span used during training. Words whose span is empty get `None`.
     pub fn score_words(
         &self,
-        frame_features: &Tensor<B, 2>,
+        frame_features: &Tensor<2>,
         config: &ScoringHeadConfig,
         words: &[(usize, usize)],
     ) -> Vec<Option<f32>> {
@@ -184,7 +183,7 @@ impl<B: Backend> ScoringHead<B> {
             .iter()
             .map(|&(position, num_words)| proportional_word_frame_span(frames, num_words, position))
             .collect();
-        let pooled: Vec<Tensor<B, 2>> = spans
+        let pooled: Vec<Tensor<2>> = spans
             .iter()
             .flatten()
             .map(|&(start, end)| self.pool(frame_features.clone().slice([start..end, 0..dim])))
@@ -207,7 +206,7 @@ impl<B: Backend> ScoringHead<B> {
 }
 
 /// Logits `[words, num_logits]` → scores `[words]` in `[0, 1]`.
-pub fn predict<B: Backend>(logits: Tensor<B, 2>, output: ScoreOutput) -> Tensor<B, 1> {
+pub fn predict(logits: Tensor<2>, output: ScoreOutput) -> Tensor<1> {
     let words = logits.dims()[0];
     match output {
         ScoreOutput::Sigmoid => sigmoid(logits).reshape([words]),
@@ -217,25 +216,22 @@ pub fn predict<B: Backend>(logits: Tensor<B, 2>, output: ScoreOutput) -> Tensor<
 }
 
 /// Mean of a one-element (or any) tensor as `f32`.
-pub(crate) fn scalar<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> f32 {
-    tensor.mean().into_scalar().elem()
+pub(crate) fn scalar<const D: usize>(tensor: Tensor<D>) -> f32 {
+    tensor.mean().into_scalar::<f32>()
 }
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::NdArray;
     use burn::tensor::{Distribution, Shape, TensorData};
 
     use super::*;
 
-    type B = NdArray;
-
     #[test]
     fn scores_are_in_unit_interval_and_skip_empty_spans() {
-        let device = Default::default();
+        let device = Device::default();
         let config = ScoringHeadConfig::new(FeatureMode::Mfcc39, 8, 4);
-        let head = config.init::<B>(&device);
-        let features = Tensor::<B, 2>::random([10, 8], Distribution::Default, &device);
+        let head = config.init(&device);
+        let features = Tensor::<2>::random([10, 8], Distribution::Default, &device);
 
         // Three words over 10 frames, plus one position past the end.
         let scores = head.score_words(&features, &config, &[(0, 3), (1, 3), (2, 3), (5, 3)]);
@@ -249,27 +245,31 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let device = Default::default();
+        let device = Device::default();
         let config = ScoringHeadConfig::new(FeatureMode::LogMel80, 6, 3);
-        let head = config.init::<B>(&device);
+        let head = config.init(&device);
         let path = dir.path().join("head");
         config.save(dir.path()).expect("save config");
         checkpoint::save(&head, &path).expect("save head");
 
-        let (loaded, loaded_config) = ScoringHead::<B>::load(&path, &device).expect("load");
+        let (loaded, loaded_config) = ScoringHead::load(&path, &device).expect("load");
         assert_eq!(loaded_config, config);
-        let x = Tensor::<B, 2>::from_data(
+        let x = Tensor::<2>::from_data(
             TensorData::new(vec![0.5f32; 12], Shape::new([2, 6])),
             &device,
         );
-        let a: Vec<f32> = head.forward(x.clone()).into_data().to_vec().expect("vec");
-        let b: Vec<f32> = loaded.forward(x).into_data().to_vec().expect("vec");
+        let a: Vec<f32> = head
+            .forward(x.clone())
+            .into_data()
+            .try_to_vec()
+            .expect("vec");
+        let b: Vec<f32> = loaded.forward(x).into_data().try_to_vec().expect("vec");
         assert_eq!(a, b);
     }
 
     #[test]
     fn missing_config_is_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(ScoringHead::<B>::load(&dir.path().join("head"), &Default::default()).is_err());
+        assert!(ScoringHead::load(&dir.path().join("head"), &Device::default()).is_err());
     }
 }

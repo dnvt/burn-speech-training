@@ -2,8 +2,22 @@
 
 ## Unreleased
 
+Burn 0.22. Checkpoints use a new file format, so models trained with 0.2.0
+must be retrained.
+
 ### Changed
 
+- Burn 0.22. Model, training and checkpoint code no longer take a backend
+  type parameter (`SpeechAligner`, not `SpeechAligner<B>`), and the
+  `backend` module is gone: pass a `burn::tensor::Device`
+  (`Device::default()` picks the first available backend).
+- Checkpoints are burnpack files (`speech-aligner-final.bpk`). Paths given
+  without an extension still work. `checkpoint::save` returns the file it
+  wrote, and `checkpoint::load` no longer takes a device. Files written by
+  0.2.0 cannot be read.
+- The default CPU backend is `flex` (pure Rust), replacing `ndarray`, which
+  Burn deprecated. The `ndarray` feature is gone.
+- `rust-version` is 1.95 (required by Burn 0.22).
 - symphonia 0.6 (audio decoding) and rand 0.10. Decoded audio is unchanged
   (checked against FLAC fixtures under both versions). Bootstrap confidence
   intervals use a fixed seed, but rand's generator changed, so their exact

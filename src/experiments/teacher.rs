@@ -20,11 +20,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use burn::nn::Linear;
-use burn::tensor::backend::Backend;
-use burn::tensor::{Shape, Tensor, TensorData};
+use burn::tensor::{Device, Shape, Tensor, TensorData};
 use serde::Deserialize;
 
-use crate::backend::{self, InferBackend};
 use crate::data::so762;
 use crate::data::TrainingSample;
 use crate::error::{self, Error, Result};
@@ -55,7 +53,7 @@ pub struct TeacherFeatures {
 }
 
 impl TeacherFeatures {
-    pub fn tensor<B: Backend>(&self, device: &B::Device) -> Tensor<B, 2> {
+    pub fn tensor(&self, device: &Device) -> Tensor<2> {
         Tensor::from_data(
             TensorData::new(self.values.clone(), Shape::new([self.frames, TEACHER_DIM])),
             device,
@@ -138,11 +136,11 @@ impl TeacherCache {
 /// the backbone receives the gradient. (The runs in the experiment log
 /// copied student features to the host first, which detached them; only the
 /// projection learned.)
-pub fn distillation_loss<B: Backend>(
-    student: Tensor<B, 2>,
+pub fn distillation_loss(
+    student: Tensor<2>,
     teacher: &TeacherFeatures,
-    projection: &Linear<B>,
-) -> Option<Tensor<B, 1>> {
+    projection: &Linear,
+) -> Option<Tensor<1>> {
     let [student_frames, dim] = student.dims();
     let common = (student_frames / 2).min(teacher.frames);
     if common == 0 {
@@ -154,7 +152,7 @@ pub fn distillation_loss<B: Backend>(
         .reshape([common, 2, dim])
         .slice([0..common, 0..1, 0..dim])
         .reshape([common, dim]);
-    let teacher = Tensor::<B, 2>::from_data(
+    let teacher = Tensor::<2>::from_data(
         TensorData::new(
             teacher.values[..common * TEACHER_DIM].to_vec(),
             Shape::new([common, TEACHER_DIM]),
@@ -172,8 +170,8 @@ pub fn evaluate_head(
     dataset: &Path,
     max_samples: Option<usize>,
 ) -> Result<Correlation> {
-    let device = backend::default_device();
-    let (head, config) = ScoringHead::<InferBackend>::load(head_path, &device)?;
+    let device = Device::default();
+    let (head, config) = ScoringHead::load(head_path, &device)?;
     if config.input_source != InputSource::TeacherCache {
         return Err(Error::config(
             "this head reads backbone features; use `evaluate::evaluate`",
@@ -257,22 +255,20 @@ pub(crate) mod tests {
 
     #[test]
     fn distillation_gradient_reaches_the_student() {
-        use burn::backend::{Autodiff, NdArray};
         use burn::nn::LinearConfig;
-        type B = Autodiff<NdArray>;
 
-        let device = Default::default();
-        let student = Tensor::<B, 2>::ones([10, 4], &device).require_grad();
+        let device = Device::default().autodiff();
+        let student = Tensor::<2>::ones([10, 4], &device).require_grad();
         let teacher = TeacherFeatures {
             values: vec![0.5; 5 * TEACHER_DIM],
             frames: 5,
         };
-        let projection = LinearConfig::new(TEACHER_DIM, 4).init::<B>(&device);
+        let projection = LinearConfig::new(TEACHER_DIM, 4).init(&device);
 
         let loss = distillation_loss(student.clone(), &teacher, &projection).expect("loss");
         let grads = loss.backward();
         let grad = student.grad(&grads).expect("student gradient");
-        let grad: Vec<f32> = grad.into_data().to_vec().expect("vec");
+        let grad: Vec<f32> = grad.into_data().try_to_vec().expect("vec");
         // Even frames are compared, odd ones are not.
         assert!(grad[..4].iter().any(|g| g.abs() > 0.0));
         assert!(grad[4..8].iter().all(|g| *g == 0.0));
