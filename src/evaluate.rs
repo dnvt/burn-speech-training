@@ -164,6 +164,15 @@ pub fn evaluate(config: &EvaluateConfig) -> Result<EvaluationReport> {
 
     let model_config = checkpoint::model_config_for(&config.checkpoint, feature_mode)?;
     checkpoint::check_feature_mode(&model_config, feature_mode)?;
+    if let Some((_, head_config)) = &head {
+        if head_config.input_dim != model_config.channels[3] {
+            return Err(Error::config(format!(
+                "the scoring head expects {}-dim features but the checkpoint produces {}; \
+                 use the backbone the head was fine-tuned with",
+                head_config.input_dim, model_config.channels[3]
+            )));
+        }
+    }
     let model = checkpoint::load(
         model_config.init::<InferBackend>(&device)?,
         &config.checkpoint,
@@ -472,6 +481,26 @@ mod tests {
         .expect("evaluate");
 
         assert_eq!(report.words_scored, 12);
+
+        // The same head with a backbone of a different width is rejected.
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).expect("mkdir");
+        std::fs::copy(&report.checkpoint, other.join("model")).expect("copy");
+        let wider = crate::model::SpeechAlignerConfig {
+            channels: [8, 8, 16, 32],
+            ..crate::finetune::tests::tiny_backbone()
+        };
+        checkpoint::save_model_config(&other, &wider).expect("config");
+        let err = evaluate(&EvaluateConfig {
+            checkpoint: other.join("model"),
+            scoring_head: report.scoring_head.clone(),
+            dataset: dir.path().join("eval.json"),
+            data_root: dir.path().to_path_buf(),
+            max_samples: None,
+            feature_mode: FeatureMode::Mfcc39,
+        })
+        .expect_err("width mismatch");
+        assert!(err.to_string().contains("scoring head expects"), "{err}");
         let names: Vec<&str> = report.methods.iter().map(|m| m.name).collect();
         assert_eq!(
             names,

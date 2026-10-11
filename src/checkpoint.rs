@@ -40,13 +40,36 @@ pub fn save<B: Backend, M: Module<B>>(module: &M, path: &Path) -> Result<()> {
 }
 
 /// Load weights from `path` into an already-initialised module of the same
-/// shape.
+/// shape. A checkpoint saved from a different architecture is an error.
 pub fn load<B: Backend, M: Module<B>>(module: M, path: &Path, device: &B::Device) -> Result<M> {
     let bytes = std::fs::read(path).map_err(|err| Error::io(path, err))?;
     let record = BinBytesRecorder::<FullPrecisionSettings>::default()
         .load(bytes, device)
         .map_err(|err| Error::checkpoint(path, err))?;
-    Ok(module.load_record(record))
+    // Burn does not check shapes when loading a record; a mismatch would only
+    // surface as a panic in the first forward pass.
+    let expected = param_shapes(&module);
+    let loaded = module.load_record(record);
+    if param_shapes(&loaded) != expected {
+        return Err(Error::checkpoint(
+            path,
+            "weights do not match the model architecture (check model-config.json)",
+        ));
+    }
+    Ok(loaded)
+}
+
+/// Shapes of all float parameters, in visiting order.
+fn param_shapes<B: Backend, M: Module<B>>(module: &M) -> Vec<Vec<usize>> {
+    struct Shapes(Vec<Vec<usize>>);
+    impl<B: Backend> ModuleVisitor<B> for Shapes {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+            self.0.push(param.val().dims().to_vec());
+        }
+    }
+    let mut shapes = Shapes(Vec::new());
+    module.visit(&mut shapes);
+    shapes.0
 }
 
 fn model_config_path(checkpoint: &Path) -> PathBuf {
@@ -113,6 +136,21 @@ mod tests {
         assert!(check_feature_mode(&logmel, FeatureMode::LogMel80).is_ok());
         let err = check_feature_mode(&logmel, FeatureMode::Mfcc39).expect_err("mismatch");
         assert!(err.to_string().contains("logmel80"), "{err}");
+    }
+
+    #[test]
+    fn mismatched_architecture_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device = Default::default();
+        let path = dir.path().join("lin");
+        save(&LinearConfig::new(3, 2).init::<NdArray>(&device), &path).expect("save");
+        let err = load(
+            LinearConfig::new(4, 2).init::<NdArray>(&device),
+            &path,
+            &device,
+        )
+        .expect_err("shape mismatch");
+        assert!(matches!(err, Error::Checkpoint { .. }), "{err}");
     }
 
     #[test]

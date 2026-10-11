@@ -96,8 +96,6 @@ pub(crate) fn learning_rate_at(base: f64, epoch: usize, total: usize, warmup: us
 pub fn train(mut samples: Vec<TrainingSample>, config: &TrainConfig) -> Result<TrainSummary> {
     validate(&samples, config)?;
     let device = backend::default_device();
-    error::create_dir_all(&config.checkpoint_dir)?;
-    checkpoint::save_model_config(&config.checkpoint_dir, &config.model)?;
 
     TrainBackend::seed(&device, config.seed);
     let mut model: SpeechAligner<TrainBackend> = config.model.init(&device)?;
@@ -106,8 +104,12 @@ pub fn train(mut samples: Vec<TrainingSample>, config: &TrainConfig) -> Result<T
         tracing::info!("resumed from {}", path.display());
     }
     let num_params = model.num_params();
+    // Only after a resume checkpoint has loaded, so a failed resume can't
+    // overwrite the config of the run it came from.
+    error::create_dir_all(&config.checkpoint_dir)?;
+    checkpoint::save_model_config(&config.checkpoint_dir, &config.model)?;
 
-    let resume = collect_resume_state(&config.checkpoint_dir, config.resume_from.as_deref())?;
+    let resume = collect_resume_state(config.resume_from.as_deref())?;
     let mut metrics = if resume.completed_epochs > 0 {
         MetricsWriter::append(
             &config.checkpoint_dir.join(METRICS_FILE),
@@ -272,14 +274,16 @@ fn checkpoint_epoch(path: &Path) -> Option<usize> {
 /// A fresh run (`resume_from == None`) always starts at epoch 0, even if the
 /// directory holds files from an earlier run. When resuming from
 /// `speech-aligner-epoch-N`, N is authoritative. For any other checkpoint
-/// name (e.g. `speech-aligner-final`) the newest epoch recorded in the
-/// directory is used. Elapsed time comes from the metrics lines up to that
-/// epoch.
-fn collect_resume_state(checkpoint_dir: &Path, resume_from: Option<&Path>) -> Result<ResumeState> {
+/// name (e.g. `speech-aligner-final`) the newest epoch recorded next to it
+/// is used. Elapsed time comes from the metrics lines up to that epoch. All
+/// of this is read from the resumed checkpoint's directory, which may differ
+/// from the new output directory.
+fn collect_resume_state(resume_from: Option<&Path>) -> Result<ResumeState> {
     let mut state = ResumeState::default();
     let Some(resume_path) = resume_from else {
         return Ok(state);
     };
+    let checkpoint_dir = resume_path.parent().unwrap_or_else(|| Path::new("."));
     let resume_epoch = checkpoint_epoch(resume_path);
 
     if let Some(epoch) = resume_epoch {
@@ -406,6 +410,34 @@ mod tests {
     }
 
     #[test]
+    fn failed_resume_keeps_existing_model_config() {
+        let dir = tempdir().expect("tempdir");
+        let first = TrainConfig {
+            model: tiny_model(),
+            epochs: 1,
+            checkpoint_dir: dir.path().to_path_buf(),
+            checkpoint_interval: 0,
+            ..TrainConfig::default()
+        };
+        let summary = train(vec![sample(20, 0.0)], &first).expect("train");
+        let saved = std::fs::read_to_string(dir.path().join("model-config.json")).expect("read");
+
+        // Resume with a different architecture into the same directory.
+        let wider = SpeechAlignerConfig {
+            channels: [8, 8, 8, 16],
+            ..tiny_model()
+        };
+        let resume = TrainConfig {
+            model: wider,
+            resume_from: Some(summary.final_checkpoint),
+            ..first
+        };
+        assert!(train(vec![sample(20, 0.0)], &resume).is_err());
+        let after = std::fs::read_to_string(dir.path().join("model-config.json")).expect("read");
+        assert_eq!(saved, after);
+    }
+
+    #[test]
     fn resume_state_uses_resume_checkpoint_epoch() {
         let dir = tempdir().expect("tempdir");
         std::fs::write(
@@ -420,8 +452,7 @@ mod tests {
         std::fs::write(dir.path().join("speech-aligner-epoch-3"), b"").expect("write");
 
         let state =
-            collect_resume_state(dir.path(), Some(Path::new("/tmp/speech-aligner-epoch-2")))
-                .expect("state");
+            collect_resume_state(Some(&dir.path().join("speech-aligner-epoch-2"))).expect("state");
         assert_eq!(
             state,
             ResumeState {
@@ -435,8 +466,7 @@ mod tests {
     fn resume_state_falls_back_to_newest_epoch() {
         let dir = tempdir().expect("tempdir");
         std::fs::write(dir.path().join("speech-aligner-epoch-3"), b"").expect("write");
-        let state = collect_resume_state(dir.path(), Some(&dir.path().join(FINAL_CHECKPOINT)))
-            .expect("state");
+        let state = collect_resume_state(Some(&dir.path().join(FINAL_CHECKPOINT))).expect("state");
         assert_eq!(state.completed_epochs, 3);
     }
 
@@ -445,7 +475,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         std::fs::write(dir.path().join("speech-aligner-epoch-7"), b"").expect("write");
         assert_eq!(
-            collect_resume_state(dir.path(), None).expect("state"),
+            collect_resume_state(None).expect("state"),
             ResumeState::default()
         );
     }

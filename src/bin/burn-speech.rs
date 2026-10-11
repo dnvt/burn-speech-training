@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use burn_speech_training::checkpoint;
 use burn_speech_training::data::librispeech::{self, LibriSpeechSource};
 use burn_speech_training::data::{cache, Batching};
 use burn_speech_training::evaluate::{evaluate, EvaluateConfig};
@@ -246,7 +247,11 @@ fn run(command: Command) -> burn_speech_training::error::Result<()> {
             let summary = train(
                 samples,
                 &TrainConfig {
-                    model: SpeechAlignerConfig::for_feature_mode(feature_mode),
+                    // A resumed checkpoint keeps its own architecture.
+                    model: match &args.resume {
+                        Some(path) => checkpoint::model_config_for(path, feature_mode)?,
+                        None => SpeechAlignerConfig::for_feature_mode(feature_mode),
+                    },
                     epochs: args.epochs,
                     learning_rate: args.lr,
                     warmup_epochs: args.warmup,
