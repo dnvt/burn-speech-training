@@ -1,0 +1,17 @@
+{
+  "condition": "baseline",
+  "train": "/path/to/word_scores_dev.json",
+  "holdout": "/path/to/word_scores_holdout.json",
+  "test": null,
+  "data_root": "/path/to/cadence/data",
+  "base_checkpoint": "/path/to/verified-conversion/speech-aligner-final.bpk",
+  "teacher_cache": "/path/to/wav2vec2-features",
+  "out": "/path/to/new-results/baseline-seed42",
+  "epochs": 20,
+  "learning_rate": 0.0001,
+  "warmup_epochs": 3,
+  "batch_size": 16,
+  "eval_interval": 1,
+  "seed": 42,
+  "max_samples": null
+}
