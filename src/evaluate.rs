@@ -163,6 +163,7 @@ pub fn evaluate(config: &EvaluateConfig) -> Result<EvaluationReport> {
         .map_or(config.feature_mode, |(_, c)| c.feature_mode);
 
     let model_config = checkpoint::model_config_for(&config.checkpoint, feature_mode)?;
+    checkpoint::check_feature_mode(&model_config, feature_mode)?;
     let model = checkpoint::load(
         model_config.init::<InferBackend>(&device)?,
         &config.checkpoint,

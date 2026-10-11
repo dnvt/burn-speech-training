@@ -143,5 +143,5 @@ bottleneck rather than a loss or architecture problem.
 | 3. Scoring head | 0.221 | 1 | Supervised scoring reaches 0.22, then plateaus |
 | 4. Loss ablation | 0.292 | 13 | CTC=0 is the single biggest gain |
 | 5. Schedule search | 0.292 | 5 | Ceiling is reproducible across schedules |
-| 6. Architecture | 0.288 | 13 | No gain; distillation/rank-reg runs were buggy |
+| 6. Architecture | 0.292 | 13 | No gain; distillation/rank-reg runs were buggy |
 | **Total** | **0.292** | **35** | **Bottleneck is feature representation** |

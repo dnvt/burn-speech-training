@@ -23,10 +23,11 @@ use crate::checkpoint;
 use crate::data::batch::{collate, plan_batches};
 use crate::data::{Batching, TrainingSample};
 use crate::error::{self, Error, Result};
-use crate::metrics::{MetricsWriter, METRICS_FILE};
+use crate::metrics::MetricsWriter;
 use crate::model::{SpeechAligner, SpeechAlignerConfig};
 
 const BATCH_LOG_INTERVAL: usize = 50;
+pub const METRICS_FILE: &str = "training-metrics.jsonl";
 const EPOCH_CHECKPOINT_PREFIX: &str = "speech-aligner-epoch-";
 pub const FINAL_CHECKPOINT: &str = "speech-aligner-final";
 
@@ -44,9 +45,10 @@ pub struct TrainConfig {
     /// Save `speech-aligner-epoch-N` every this many epochs; `0` saves only
     /// the final checkpoint.
     pub checkpoint_interval: usize,
-    /// Continue from a checkpoint. Epoch numbering and the metrics file
-    /// continue from where that run stopped. Optimizer state is not saved,
-    /// so Adam's moment estimates restart.
+    /// Continue from a checkpoint. Epoch numbering, the learning-rate
+    /// schedule and the metrics file continue from where that run stopped;
+    /// `epochs` is the number of *additional* epochs. Optimizer state is not
+    /// saved, so Adam's moment estimates restart.
     pub resume_from: Option<PathBuf>,
     /// Seeds weight initialisation and batch order.
     pub seed: u64,
@@ -107,9 +109,12 @@ pub fn train(mut samples: Vec<TrainingSample>, config: &TrainConfig) -> Result<T
 
     let resume = collect_resume_state(&config.checkpoint_dir, config.resume_from.as_deref())?;
     let mut metrics = if resume.completed_epochs > 0 {
-        MetricsWriter::append(&config.checkpoint_dir, resume.elapsed_offset_secs)?
+        MetricsWriter::append(
+            &config.checkpoint_dir.join(METRICS_FILE),
+            resume.elapsed_offset_secs,
+        )?
     } else {
-        MetricsWriter::create(&config.checkpoint_dir)?
+        MetricsWriter::create(&config.checkpoint_dir.join(METRICS_FILE))?
     };
 
     let plan = plan_batches(&mut samples, config.batching, config.model.n_heads);
@@ -123,7 +128,10 @@ pub fn train(mut samples: Vec<TrainingSample>, config: &TrainConfig) -> Result<T
 
     let ctc = CTCLossConfig::new().with_zero_infinity(true).init();
     let mut optimizer = AdamConfig::new().init::<TrainBackend, SpeechAligner<TrainBackend>>();
-    let mut rng = StdRng::seed_from_u64(config.seed);
+    // Offset by completed epochs so a resumed run doesn't replay the batch
+    // order of the first run.
+    let mut rng = StdRng::seed_from_u64(config.seed + resume.completed_epochs as u64);
+    let total_epochs = resume.completed_epochs + config.epochs;
     let mut order: Vec<usize> = (0..plan.len()).collect();
     let mut epoch_losses = Vec::with_capacity(config.epochs);
 
@@ -131,8 +139,8 @@ pub fn train(mut samples: Vec<TrainingSample>, config: &TrainConfig) -> Result<T
         let epoch = resume.completed_epochs + epoch_idx + 1;
         let lr = learning_rate_at(
             config.learning_rate,
-            epoch_idx,
-            config.epochs,
+            epoch - 1,
+            total_epochs,
             config.warmup_epochs,
         );
         let epoch_start = Instant::now();

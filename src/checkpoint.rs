@@ -65,6 +65,24 @@ pub fn save_model_config(dir: &Path, config: &SpeechAlignerConfig) -> Result<()>
     )
 }
 
+/// Error unless the model takes `feature_mode`'s features as input.
+pub fn check_feature_mode(config: &SpeechAlignerConfig, feature_mode: FeatureMode) -> Result<()> {
+    if config.input_dim == feature_mode.feature_dim() {
+        return Ok(());
+    }
+    let hint = [FeatureMode::Mfcc39, FeatureMode::LogMel80]
+        .into_iter()
+        .find(|mode| mode.feature_dim() == config.input_dim)
+        .map(|mode| format!("; it was probably trained with {}", mode.label()))
+        .unwrap_or_default();
+    Err(Error::config(format!(
+        "the model expects {}-dim input but {} features are {}-dim{hint}",
+        config.input_dim,
+        feature_mode.label(),
+        feature_mode.feature_dim()
+    )))
+}
+
 /// Model config for a checkpoint: read from `model-config.json` next to it,
 /// or the default config for `feature_mode` if that file does not exist
 /// (checkpoints written before configs were saved).
@@ -88,6 +106,14 @@ mod tests {
     use burn::nn::LinearConfig;
 
     use super::*;
+
+    #[test]
+    fn feature_mode_must_match_input_dim() {
+        let logmel = SpeechAlignerConfig::for_feature_mode(FeatureMode::LogMel80);
+        assert!(check_feature_mode(&logmel, FeatureMode::LogMel80).is_ok());
+        let err = check_feature_mode(&logmel, FeatureMode::Mfcc39).expect_err("mismatch");
+        assert!(err.to_string().contains("logmel80"), "{err}");
+    }
 
     #[test]
     fn roundtrip_of_never_used_module() {

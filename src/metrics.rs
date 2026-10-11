@@ -1,7 +1,8 @@
 //! Training metrics as JSON lines.
 //!
-//! Each event is written as one JSON object to `training-metrics.jsonl` in
-//! the checkpoint directory and mirrored to `tracing` at debug level (target
+//! Each event is written as one JSON object per line (`train` uses
+//! `training-metrics.jsonl`, `finetune` uses `finetune-metrics.jsonl` in the
+//! checkpoint directory) and mirrored to `tracing` at debug level (target
 //! `training_metrics`). Every line carries `event` and `elapsed_secs`.
 
 use std::fs::File;
@@ -13,8 +14,6 @@ use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
 
-pub const METRICS_FILE: &str = "training-metrics.jsonl";
-
 pub struct MetricsWriter {
     file: File,
     started: Instant,
@@ -23,25 +22,24 @@ pub struct MetricsWriter {
 
 impl MetricsWriter {
     /// Start a new metrics file, replacing any existing one.
-    pub fn create(dir: &Path) -> Result<Self> {
-        Self::open(dir, false, 0.0)
+    pub fn create(path: &Path) -> Result<Self> {
+        Self::open(path, false, 0.0)
     }
 
     /// Append to an existing metrics file when resuming a run.
     /// `elapsed_offset_secs` is the wall-clock time of the earlier run.
-    pub fn append(dir: &Path, elapsed_offset_secs: f64) -> Result<Self> {
-        Self::open(dir, true, elapsed_offset_secs)
+    pub fn append(path: &Path, elapsed_offset_secs: f64) -> Result<Self> {
+        Self::open(path, true, elapsed_offset_secs)
     }
 
-    fn open(dir: &Path, append: bool, elapsed_offset_secs: f64) -> Result<Self> {
-        let path = dir.join(METRICS_FILE);
+    fn open(path: &Path, append: bool, elapsed_offset_secs: f64) -> Result<Self> {
         let file = File::options()
             .create(true)
             .write(true)
             .append(append)
             .truncate(!append)
-            .open(&path)
-            .map_err(|err| Error::io(&path, err))?;
+            .open(path)
+            .map_err(|err| Error::io(path, err))?;
         Ok(Self {
             file,
             started: Instant::now(),
@@ -88,11 +86,11 @@ mod tests {
     #[test]
     fn writes_one_json_object_per_event() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut metrics = MetricsWriter::create(dir.path()).expect("create");
+        let mut metrics = MetricsWriter::create(&dir.path().join("m.jsonl")).expect("create");
         metrics.log("epoch", json!({ "epoch": 1, "loss": 0.5 }));
         metrics.log("epoch", json!({ "epoch": 2, "loss": 0.25 }));
 
-        let raw = std::fs::read_to_string(dir.path().join(METRICS_FILE)).expect("read");
+        let raw = std::fs::read_to_string(dir.path().join("m.jsonl")).expect("read");
         let lines: Vec<Value> = raw
             .lines()
             .map(|line| serde_json::from_str(line).expect("json"))
@@ -106,14 +104,14 @@ mod tests {
     #[test]
     fn append_keeps_existing_lines() {
         let dir = tempfile::tempdir().expect("tempdir");
-        MetricsWriter::create(dir.path())
+        MetricsWriter::create(&dir.path().join("m.jsonl"))
             .expect("create")
             .log("epoch", json!({ "epoch": 1 }));
-        MetricsWriter::append(dir.path(), 10.0)
+        MetricsWriter::append(&dir.path().join("m.jsonl"), 10.0)
             .expect("append")
             .log("epoch", json!({ "epoch": 2 }));
 
-        let raw = std::fs::read_to_string(dir.path().join(METRICS_FILE)).expect("read");
+        let raw = std::fs::read_to_string(dir.path().join("m.jsonl")).expect("read");
         assert_eq!(raw.lines().count(), 2);
     }
 }

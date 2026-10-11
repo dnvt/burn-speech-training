@@ -66,8 +66,9 @@ burn-speech evaluate --checkpoint ckpt-ft/speech-aligner-ft-best \
 ```
 
 `--help` on any command lists every option. Progress is logged to stderr;
-set `RUST_LOG=debug` for more. Per-epoch metrics are written to
-`training-metrics.jsonl` in the checkpoint directory.
+set `RUST_LOG=debug` for more. Per-epoch metrics are written as JSON lines
+to `training-metrics.jsonl` (train) or `finetune-metrics.jsonl` (finetune) in
+the output directory.
 
 LibriSpeech audio is used as is (16 kHz FLAC). SpeechOcean762 needs to be
 flattened to one JSON entry per word; the format is documented in
@@ -135,7 +136,7 @@ predicted and human word scores. Full configs and numbers are in
 | 3. Scoring head | 1 | 0.221 | Supervised head helps, plateaus by epoch 4 |
 | 4. Loss ablation | 13 | **0.292** | Setting CTC weight to 0 is the largest gain (+0.07) |
 | 5. Schedules | 5 | 0.292 | Warmup + cosine is stable; freezing the backbone hurts |
-| 6. Architecture | 13 | 0.288 | No gain (distillation and rank-regularization runs were buggy, see the log) |
+| 6. Architecture | 13 | 0.292 | No gain over Round 5 (distillation and rank-regularization runs were buggy, see the log) |
 
 What the runs suggest:
 

@@ -324,7 +324,7 @@ pub fn finetune(config: &ExperimentConfig) -> Result<FineTuneSummary> {
     error::create_dir_all(&base.checkpoint_dir)?;
     checkpoint::save_model_config(&base.checkpoint_dir, &backbone_config)?;
     head_config.save(&base.checkpoint_dir)?;
-    let mut metrics = MetricsWriter::create(&base.checkpoint_dir)?;
+    let mut metrics = MetricsWriter::create(&base.checkpoint_dir.join(core::METRICS_FILE))?;
 
     items.sort_by_key(|(u, _)| u.sample.num_frames());
     let mut batches: Vec<&[(ScoredUtterance, Option<TeacherFeatures>)]> =

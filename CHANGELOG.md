@@ -40,6 +40,12 @@ The crate was reorganised around a smaller API. Breaking changes throughout.
 - Cache format version 2 stores `feature_dim`; version 1 files still load.
 - One training loop for LibriSpeech and cached features.
 - The CMU dictionary licence is included and declared in `Cargo.toml`.
+- Scoring heads are saved as `scoring-head-{best,final}` with a required
+  `scoring-head-config.json`; heads written by 0.1.0 do not load. Backbone
+  checkpoints and version 1 feature caches still load.
+- Fine-tuning metrics go to `finetune-metrics.jsonl`.
+- Resuming training continues the learning-rate schedule.
+- `rust-version` is 1.92 (required by Burn 0.21; 1.87 never built).
 
 ## 0.1.0 - 2026-04-02
 

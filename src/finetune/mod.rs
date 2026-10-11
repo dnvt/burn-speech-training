@@ -45,6 +45,9 @@ pub const FINAL_HEAD: &str = "scoring-head-final";
 pub const BEST_MODEL: &str = "speech-aligner-ft-best";
 pub const BEST_HEAD: &str = "scoring-head-best";
 const HOLDOUT_BOOTSTRAP: usize = 1000;
+/// Separate from `train`'s metrics so fine-tuning into a pre-training
+/// directory does not overwrite them.
+pub const METRICS_FILE: &str = "finetune-metrics.jsonl";
 
 #[derive(Debug, Clone)]
 pub struct FineTuneConfig {
@@ -124,13 +127,15 @@ impl FineTuneConfig {
     }
 
     pub(crate) fn backbone_config(&self) -> Result<SpeechAlignerConfig> {
-        match &self.base_checkpoint {
+        let config = match &self.base_checkpoint {
             Some(path) => checkpoint::model_config_for(path, self.feature_mode),
             None => Ok(self
                 .model
                 .clone()
                 .unwrap_or_else(|| SpeechAlignerConfig::for_feature_mode(self.feature_mode))),
-        }
+        }?;
+        checkpoint::check_feature_mode(&config, self.feature_mode)?;
+        Ok(config)
     }
 
     pub(crate) fn init_backbone(
@@ -321,7 +326,7 @@ pub fn finetune(config: &FineTuneConfig) -> Result<FineTuneSummary> {
     error::create_dir_all(&config.checkpoint_dir)?;
     checkpoint::save_model_config(&config.checkpoint_dir, &backbone_config)?;
     head_config.save(&config.checkpoint_dir)?;
-    let mut metrics = MetricsWriter::create(&config.checkpoint_dir)?;
+    let mut metrics = MetricsWriter::create(&config.checkpoint_dir.join(METRICS_FILE))?;
 
     tracing::info!(
         "fine-tuning on {} utterances ({} words), {} holdout utterances, backend {}",
