@@ -54,6 +54,10 @@ features = ["experiments"]
 name = "burn-speech"
 required-features = ["cli"]
 
+[[example]]
+name = "rerun_round6"
+required-features = ["experiments"]
+
 # Burn's CPU kernels are very slow without optimisation; optimise
 # dependencies in debug builds so `cargo test` stays fast.
 [profile.dev.package."*"]
