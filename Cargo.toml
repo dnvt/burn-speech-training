@@ -30,7 +30,7 @@ experiments = []
 cli = ["dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
-burn = { version = "0.21.0", default-features = false }
+burn = { version = "0.22.0", default-features = false }
 symphonia = { version = "0.6", default-features = false, features = ["flac", "pcm", "wav"] }
 realfft = "3.5"
 serde = { version = "1", features = ["derive"] }
