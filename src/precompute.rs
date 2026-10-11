@@ -4,7 +4,7 @@
 //! eliminating the CPU bottleneck during GPU training. Each sample
 //! becomes a flat binary file with a compact header.
 
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use crate::g2p::CmuDict;
@@ -260,23 +260,21 @@ fn write_binary_sample(
     feature_dim: usize,
     targets: &[i32],
 ) -> Result<()> {
-    let mut file = std::fs::File::create(path)
-        .map_err(|e| Error::process(format!("Cannot create {}: {e}", path.display())))?;
+    let too_large = || {
+        Error::process(format!(
+            "Sample too large for cache format: {}",
+            path.display()
+        ))
+    };
+    let num_frames = u32::try_from(feature_frames.len()).map_err(|_| too_large())?;
+    let num_targets = u32::try_from(targets.len()).map_err(|_| too_large())?;
 
-    file.write_all(&MAGIC)
-        .map_err(|e| Error::process(format!("Write error: {e}")))?;
-    #[allow(clippy::cast_possible_truncation)]
-    let num_frames = feature_frames.len() as u32;
-    #[allow(clippy::cast_possible_truncation)]
-    let num_targets = targets.len() as u32;
-    file.write_all(&VERSION.to_le_bytes())
-        .map_err(|e| Error::process(format!("Write error: {e}")))?;
-    file.write_all(&num_frames.to_le_bytes())
-        .map_err(|e| Error::process(format!("Write error: {e}")))?;
-    file.write_all(&num_targets.to_le_bytes())
-        .map_err(|e| Error::process(format!("Write error: {e}")))?;
+    let mut buf = Vec::with_capacity(16 + (feature_frames.len() * feature_dim + targets.len()) * 4);
+    buf.extend_from_slice(&MAGIC);
+    buf.extend_from_slice(&VERSION.to_le_bytes());
+    buf.extend_from_slice(&num_frames.to_le_bytes());
+    buf.extend_from_slice(&num_targets.to_le_bytes());
 
-    // Write feature data as flat f32 array
     for frame in feature_frames {
         if frame.len() != feature_dim {
             return Err(Error::config(format!(
@@ -287,18 +285,15 @@ fn write_binary_sample(
             )));
         }
         for &val in frame {
-            file.write_all(&val.to_le_bytes())
-                .map_err(|e| Error::process(format!("Write error: {e}")))?;
+            buf.extend_from_slice(&val.to_le_bytes());
         }
     }
-
-    // Write targets as i32 array
     for &t in targets {
-        file.write_all(&t.to_le_bytes())
-            .map_err(|e| Error::process(format!("Write error: {e}")))?;
+        buf.extend_from_slice(&t.to_le_bytes());
     }
 
-    Ok(())
+    std::fs::write(path, buf)
+        .map_err(|e| Error::process(format!("Cannot write {}: {e}", path.display())))
 }
 
 #[allow(dead_code)]

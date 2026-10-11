@@ -4,3 +4,7 @@ This project is dual-licensed under either of:
 - MIT license, in LICENSE-MIT
 
 You may choose either license for your use.
+
+The bundled CMU Pronouncing Dictionary (src/g2p/data/cmudict.dict) is
+copyright Carnegie Mellon University and distributed under its own BSD-style
+license, in src/g2p/data/LICENSE.

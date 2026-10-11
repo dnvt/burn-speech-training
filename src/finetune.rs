@@ -700,7 +700,7 @@ mod inner {
         checkpoint_dir.join("scoring-head-config.json")
     }
 
-    fn scoring_head_config_path_for_head(scoring_head_path: &Path) -> PathBuf {
+    pub(super) fn scoring_head_config_path_for_head(scoring_head_path: &Path) -> PathBuf {
         let parent = scoring_head_path.parent().unwrap_or_else(|| Path::new("."));
         scoring_head_config_path_for_dir(parent)
     }
@@ -719,12 +719,31 @@ mod inner {
         Ok(())
     }
 
-    pub fn load_scoring_head_config(scoring_head_path: &Path) -> ScoringHeadConfig {
+    /// Load the JSON config saved next to a scoring head checkpoint.
+    ///
+    /// A missing file yields the default config (heads saved before configs
+    /// were written). A file that exists but does not parse is an error:
+    /// silently falling back would load the wrong head type.
+    pub fn load_scoring_head_config(scoring_head_path: &Path) -> Result<ScoringHeadConfig> {
         let path = scoring_head_config_path_for_head(scoring_head_path);
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            return ScoringHeadConfig::default();
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ScoringHeadConfig::default());
+            }
+            Err(err) => {
+                return Err(Error::process(format!(
+                    "Cannot read scoring head config {}: {err}",
+                    path.display()
+                )));
+            }
         };
-        serde_json::from_str(&raw).unwrap_or_default()
+        serde_json::from_str(&raw).map_err(|err| {
+            Error::config(format!(
+                "Invalid scoring head config {}: {err}",
+                path.display()
+            ))
+        })
     }
 
     fn scoring_head_hidden_candidates(config: &ScoringHeadConfig) -> Vec<usize> {
@@ -2705,7 +2724,7 @@ mod inner {
         input_dim: usize,
         device: &B::Device,
     ) -> Result<ScoringHead<B>> {
-        let config = load_scoring_head_config(path);
+        let config = load_scoring_head_config(path)?;
         let bytes = std::fs::read(path).map_err(|err| {
             Error::config(format!(
                 "Cannot read scoring head {}: {err}",
@@ -3042,9 +3061,10 @@ mod tests {
         balanced_mse_loss, build_scoring_batch, load_scoring_head_checkpoint,
         load_scoring_head_config, load_teacher_feature_cache, ordinal_bin_index,
         pairwise_ranking_loss, save_scoring_head_checkpoint, score_balanced_weights_from_counts,
-        scoring_input_dim_from_config, scoring_predictions_from_logits, triplet_ranking_loss,
-        EpochStats, LegacyScoringHead, MetricsWriter, ScoringHead, ScoringHeadConfig,
-        ScoringInputSource, ScoringPoolingMode, WordTarget,
+        scoring_head_config_path_for_head, scoring_input_dim_from_config,
+        scoring_predictions_from_logits, triplet_ranking_loss, EpochStats, LegacyScoringHead,
+        MetricsWriter, ScoringHead, ScoringHeadConfig, ScoringInputSource, ScoringPoolingMode,
+        WordTarget,
     };
 
     type B = NdArray<f32>;
@@ -3159,7 +3179,7 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serialize config");
         std::fs::write(&config_path, json).expect("write config");
 
-        let loaded = load_scoring_head_config(&scoring_head_path);
+        let loaded = load_scoring_head_config(&scoring_head_path).expect("load config");
 
         assert_eq!(
             loaded.scoring_input_source,
@@ -3355,13 +3375,22 @@ mod tests {
     #[test]
     fn test_load_scoring_head_config_defaults_when_missing() {
         let tempdir = tempdir().expect("tempdir");
-        let config = load_scoring_head_config(&tempdir.path().join("missing-head"));
+        let config =
+            load_scoring_head_config(&tempdir.path().join("missing-head")).expect("load config");
         assert!(!config.ordinal_loss);
         assert!(!config.ordinal_softmax_loss);
         assert!(!config.balanced_mse);
         assert_eq!(config.pooling_mode, ScoringPoolingMode::Mean);
         assert_eq!(config.hidden_dim, 256);
         assert_eq!(config.output_dim, 1);
+    }
+
+    #[test]
+    fn test_load_scoring_head_config_rejects_invalid_json() {
+        let tempdir = tempdir().expect("tempdir");
+        let head = tempdir.path().join("scoring-head");
+        std::fs::write(scoring_head_config_path_for_head(&head), "{not json").expect("write");
+        assert!(load_scoring_head_config(&head).is_err());
     }
 
     #[test]

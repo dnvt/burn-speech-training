@@ -353,19 +353,28 @@ mod inner {
         checkpoint_epoch_from_name(path.file_name()?.to_str()?)
     }
 
+    /// Work out how many epochs a resumed run has already completed.
+    ///
+    /// A fresh run (`resume_from == None`) always starts at epoch 0, even if
+    /// the checkpoint directory holds files from an earlier run. When resuming
+    /// from `speech-aligner-epoch-N`, N is authoritative; later checkpoints in
+    /// the same directory are ignored. Elapsed time is read from the metrics
+    /// lines up to that epoch.
     pub(super) fn collect_resume_state(
         checkpoint_dir: &Path,
         resume_from: Option<&Path>,
     ) -> Result<ResumeState> {
         let mut state = ResumeState::default();
+        let Some(resume_path) = resume_from else {
+            return Ok(state);
+        };
+        let resume_epoch = checkpoint_epoch_from_path(resume_path);
 
-        if let Some(resume_path) = resume_from {
-            if let Some(epoch) = checkpoint_epoch_from_path(resume_path) {
-                state.completed_epochs = state.completed_epochs.max(epoch);
-            }
-        }
-
-        if let Ok(entries) = std::fs::read_dir(checkpoint_dir) {
+        if let Some(epoch) = resume_epoch {
+            state.completed_epochs = epoch;
+        } else if let Ok(entries) = std::fs::read_dir(checkpoint_dir) {
+            // Resuming from a non-epoch checkpoint (e.g. `speech-aligner-final`):
+            // fall back to the newest epoch checkpoint in the directory.
             for entry in entries {
                 let entry = entry.map_err(|err| {
                     Error::process(format!(
@@ -397,10 +406,15 @@ mod inner {
                     continue;
                 };
 
-                if let Some(epoch) = json_usize(&value, "epoch") {
-                    state.completed_epochs = state.completed_epochs.max(epoch);
-                } else if let Some(epoch) = json_usize(&value, "epochs") {
-                    state.completed_epochs = state.completed_epochs.max(epoch);
+                let line_epoch =
+                    json_usize(&value, "epoch").or_else(|| json_usize(&value, "epochs"));
+                if resume_epoch.is_none() {
+                    if let Some(epoch) = line_epoch {
+                        state.completed_epochs = state.completed_epochs.max(epoch);
+                    }
+                }
+                if line_epoch.is_some_and(|epoch| epoch > state.completed_epochs) {
+                    continue;
                 }
 
                 if let Some(elapsed_secs) =
@@ -1062,14 +1076,15 @@ mod tests {
     use super::inner::{collect_resume_state, ResumeState};
 
     #[test]
-    fn test_collect_resume_state_uses_existing_metrics_and_checkpoints() {
+    fn test_collect_resume_state_uses_resume_checkpoint_epoch() {
         let tempdir = tempdir().expect("tempdir");
         let checkpoint_dir = tempdir.path();
         std::fs::write(
             checkpoint_dir.join("training-metrics.jsonl"),
             concat!(
                 "{\"event\":\"epoch\",\"epoch\":2,\"elapsed_secs\":18.0}\n",
-                "{\"event\":\"batch\",\"epoch\":2,\"elapsed_secs\":20.0}\n"
+                "{\"event\":\"batch\",\"epoch\":2,\"elapsed_secs\":20.0}\n",
+                "{\"event\":\"epoch\",\"epoch\":3,\"elapsed_secs\":30.0}\n"
             ),
         )
         .expect("write metrics");
@@ -1085,9 +1100,37 @@ mod tests {
         assert_eq!(
             state,
             ResumeState {
-                completed_epochs: 3,
+                completed_epochs: 2,
                 elapsed_offset_secs: 20.0
             }
         );
+    }
+
+    #[test]
+    fn test_collect_resume_state_falls_back_to_newest_epoch() {
+        let tempdir = tempdir().expect("tempdir");
+        let checkpoint_dir = tempdir.path();
+        std::fs::write(checkpoint_dir.join("speech-aligner-epoch-3"), b"")
+            .expect("write checkpoint");
+
+        let state = collect_resume_state(
+            checkpoint_dir,
+            Some(&checkpoint_dir.join("speech-aligner-final")),
+        )
+        .expect("resume state");
+
+        assert_eq!(state.completed_epochs, 3);
+    }
+
+    #[test]
+    fn test_collect_resume_state_ignores_old_run_without_resume() {
+        let tempdir = tempdir().expect("tempdir");
+        let checkpoint_dir = tempdir.path();
+        std::fs::write(checkpoint_dir.join("speech-aligner-epoch-7"), b"")
+            .expect("write checkpoint");
+
+        let state = collect_resume_state(checkpoint_dir, None).expect("resume state");
+
+        assert_eq!(state, ResumeState::default());
     }
 }

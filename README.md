@@ -293,4 +293,8 @@ To use a different dataset, implement `load_audio_samples()` and
 
 ## License
 
-MIT OR Apache-2.0
+The code is licensed under MIT OR Apache-2.0, at your option.
+
+The bundled CMU Pronouncing Dictionary (`src/g2p/data/cmudict.dict`) is
+copyright Carnegie Mellon University and distributed under its BSD-style
+license, in [`src/g2p/data/LICENSE`](src/g2p/data/LICENSE).

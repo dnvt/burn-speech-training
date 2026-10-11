@@ -2,7 +2,6 @@
 //! human scores. Computes CTC-based GOP and reports Spearman correlation.
 
 mod inner {
-    use std::cmp::Ordering;
     use std::path::{Path, PathBuf};
 
     use burn::module::Module;
@@ -132,7 +131,7 @@ mod inner {
         step("Loading checkpoint");
         let mut scoring_config = ScoringHeadConfig::default();
         if let Some(path) = args.scoring_head.as_ref() {
-            scoring_config = load_scoring_head_config(path);
+            scoring_config = load_scoring_head_config(path)?;
             resolved_feature_mode = scoring_config.feature_mode;
         }
         let config = SpeechAlignerConfig::for_feature_mode(resolved_feature_mode);
@@ -448,7 +447,7 @@ mod inner {
         let best_metric = metrics
             .iter()
             .filter(|metric| metric.words_scored >= 10)
-            .max_by(|a, b| a.rho.partial_cmp(&b.rho).unwrap_or(Ordering::Equal))
+            .max_by(|a, b| a.rho.total_cmp(&b.rho))
             .ok_or_else(|| Error::process("No evaluation metrics were produced"))?;
 
         #[allow(clippy::cast_precision_loss)]
@@ -967,7 +966,7 @@ mod inner {
     pub fn ranks(values: &[f64]) -> Vec<f64> {
         let n = values.len();
         let mut indexed: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         let mut result = vec![0.0; n];
         let mut i = 0;
@@ -1011,13 +1010,14 @@ mod inner {
             rhos.push(spearman_rho(&bx, &by));
         }
 
-        rhos.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let lo_idx = (0.025 * n_boot as f64) as usize;
-        let hi_idx = (0.975 * n_boot as f64) as usize;
-        (
-            rhos.get(lo_idx).copied().unwrap_or(0.0),
-            rhos.get(hi_idx.min(rhos.len() - 1)).copied().unwrap_or(0.0),
-        )
+        if rhos.is_empty() {
+            return (0.0, 0.0);
+        }
+        rhos.sort_by(f64::total_cmp);
+        let last = rhos.len() - 1;
+        let lo_idx = (0.025 * last as f64).round() as usize;
+        let hi_idx = (0.975 * last as f64).round() as usize;
+        (rhos[lo_idx], rhos[hi_idx])
     }
 
     // ── Report formatting ───────────────────────────────────────────
@@ -1040,7 +1040,7 @@ mod inner {
         let best_metric = metrics
             .iter()
             .filter(|metric| metric.words_scored >= 10)
-            .max_by(|a, b| a.rho.partial_cmp(&b.rho).unwrap_or(Ordering::Equal));
+            .max_by(|a, b| a.rho.total_cmp(&b.rho));
         let best_metric = match best_metric {
             Some(metric) => metric,
             None => {

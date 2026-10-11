@@ -30,10 +30,13 @@ It is not evidence of real speech quality.
 
 ## CMU Pronouncing Dictionary
 
-- Source: Carnegie Mellon University Pronouncing Dictionary.
+- Source: [cmusphinx/cmudict](https://github.com/cmusphinx/cmudict).
 - Used for: transcript to ARPABET phoneme lookup in the G2P path.
-- Included in this repo: a compact generated lookup is built into the crate.
-- Notes: unknown words use the crate's fallback path, so G2P quality is a known
+- Included in this repo: yes, the full dictionary text at
+  `src/g2p/data/cmudict.dict`. `build.rs` converts it to a binary lookup that is
+  embedded in the compiled crate.
+- License: BSD-style, Carnegie Mellon University. See `src/g2p/data/LICENSE`.
+- Notes: unknown words use the crate's fallback rules, so G2P quality is a known
   limitation for out-of-vocabulary text.
 
 ## Private Or User Audio
