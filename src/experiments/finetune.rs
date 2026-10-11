@@ -10,7 +10,7 @@ use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::Tensor;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::losses::{self, ordinal_bin};
 use super::teacher::{self, TeacherCache, TeacherFeatures, TEACHER_DIM};

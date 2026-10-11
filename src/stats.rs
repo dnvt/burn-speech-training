@@ -1,7 +1,7 @@
 //! Correlation statistics used to compare predicted and human scores.
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// Agreement between predicted and human scores.
 #[derive(Debug, Clone, Copy, PartialEq)]
