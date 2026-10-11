@@ -1,1039 +1,407 @@
-//! Real-data training loop for `SpeechAligner` using `LibriSpeech`.
+//! CTC training for `SpeechAligner`.
 //!
-//! Supports both CPU (`NdArray`) and GPU (`Cuda`) backends. The backend is
-//! selected at compile time via feature flags:
-//! - `ndarray`: CPU training (`NdArray` + `Autodiff`)
-//! - `wgpu`: GPU training (`Wgpu` + `Autodiff`) via Vulkan/Metal
-//! - `cuda`: GPU training (`Cuda` + `Autodiff`) — requires NVIDIA GPU
+//! [`train`] takes any list of [`TrainingSample`]s, so the same loop serves
+//! LibriSpeech ([`crate::data::librispeech::load`]), the precomputed cache
+//! ([`crate::data::cache::load`]) or your own data.
 
-use std::io::{BufRead, BufReader, Write as _};
-use std::path::Path;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::g2p::CmuDict;
 use burn::module::{AutodiffModule, Module};
+use burn::nn::loss::CTCLossConfig;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
-use burn::record::{BinBytesRecorder, FullPrecisionSettings, Recorder};
-use burn::tensor::backend::{AutodiffBackend, Backend};
-use serde_json::Value;
+use burn::tensor::backend::Backend;
+use burn::tensor::ElementConversion;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
+use serde_json::{json, Value};
 
-use crate::dataset::{create_batches, create_dynamic_batches, process_utterance, scan_librispeech};
-use crate::error::{Error, Result};
-use crate::loss::SpeechAlignerLossConfig;
-use crate::mfcc::{FeatureMode, MfccExtractor};
+use crate::backend::{self, TrainBackend};
+use crate::checkpoint;
+use crate::data::batch::{collate, plan_batches};
+use crate::data::{Batching, TrainingSample};
+use crate::error::{self, Error, Result};
+use crate::metrics::{MetricsWriter, METRICS_FILE};
 use crate::model::{SpeechAligner, SpeechAlignerConfig};
-use crate::precompute::PrecomputedManifest;
-use crate::ui::{detail, section, step, success};
 
-/// Arguments for real-data training.
-pub struct TrainRealArgs {
-    pub data_dir: std::path::PathBuf,
-    pub split: String,
+const BATCH_LOG_INTERVAL: usize = 50;
+const EPOCH_CHECKPOINT_PREFIX: &str = "speech-aligner-epoch-";
+pub const FINAL_CHECKPOINT: &str = "speech-aligner-final";
+
+#[derive(Debug, Clone)]
+pub struct TrainConfig {
+    /// Must have `input_dim` equal to the samples' feature dimension.
+    pub model: SpeechAlignerConfig,
     pub epochs: usize,
-    pub batch_size: usize,
     pub learning_rate: f64,
-    pub checkpoint_dir: std::path::PathBuf,
+    /// Linear warmup over this many epochs, then cosine decay to zero.
+    /// `0` keeps the learning rate constant.
+    pub warmup_epochs: usize,
+    pub batching: Batching,
+    pub checkpoint_dir: PathBuf,
+    /// Save `speech-aligner-epoch-N` every this many epochs; `0` saves only
+    /// the final checkpoint.
     pub checkpoint_interval: usize,
-    pub max_duration_secs: f32,
-    pub feature_mode: FeatureMode,
+    /// Continue from a checkpoint. Epoch numbering and the metrics file
+    /// continue from where that run stopped. Optimizer state is not saved,
+    /// so Adam's moment estimates restart.
+    pub resume_from: Option<PathBuf>,
+    /// Seeds weight initialisation and batch order.
+    pub seed: u64,
 }
 
-/// Execute real-data training on `LibriSpeech`.
-///
-/// Selects the backend based on compile-time feature flags:
-/// - `cuda` enabled → CUDA backend on GPU
-/// - `ndarray` only → `NdArray` backend on CPU
-pub fn execute_train_real(args: &TrainRealArgs) -> Result<()> {
-    if args.batch_size == 0 {
-        return Err(Error::config("batch_size must be > 0"));
-    }
-
-    let samples = load_and_extract(args)?;
-
-    // Backend priority: CUDA > WGPU > NdArray.
-    #[cfg(feature = "cuda")]
-    {
-        use burn::backend::cuda::CudaDevice;
-        use burn::backend::{Autodiff, Cuda};
-
-        type TrainB = Autodiff<Cuda>;
-        type InferB = Cuda;
-
-        let device = CudaDevice::default();
-        detail("  Backend: Autodiff<Cuda> (CUDA GPU)");
-        train_loop::<TrainB, InferB>(args, samples, &device, "Autodiff<Cuda> (CUDA GPU)")
-    }
-
-    #[cfg(all(feature = "wgpu", not(feature = "cuda")))]
-    {
-        use burn::backend::wgpu::{Wgpu, WgpuDevice};
-        use burn::backend::Autodiff;
-
-        type TrainB = Autodiff<Wgpu>;
-        type InferB = Wgpu;
-
-        let device = WgpuDevice::default();
-        detail("  Backend: Autodiff<Wgpu> (Vulkan/Metal GPU)");
-        train_loop::<TrainB, InferB>(args, samples, &device, "Autodiff<Wgpu> (Vulkan/Metal GPU)")
-    }
-
-    #[cfg(not(any(feature = "cuda", feature = "wgpu")))]
-    {
-        use burn::backend::ndarray::NdArrayDevice;
-        use burn::backend::{Autodiff, NdArray};
-
-        type TrainB = Autodiff<NdArray>;
-        type InferB = NdArray;
-
-        let device = NdArrayDevice::default();
-        detail("  Backend: Autodiff<NdArray> (CPU)");
-        train_loop::<TrainB, InferB>(args, samples, &device, "Autodiff<NdArray> (CPU)")
-    }
-}
-
-/// Load data and extract features (backend-independent).
-fn load_and_extract(args: &TrainRealArgs) -> Result<Vec<crate::dataset::TrainingSample>> {
-    section("SpeechAligner Real-Data Training");
-
-    step("Loading resources");
-    let dict =
-        CmuDict::load().map_err(|e| Error::config(format!("Failed to load CMUdict: {e}")))?;
-    detail("  CMUdict loaded");
-
-    let extractor = MfccExtractor::with_mode(args.feature_mode);
-    detail(&format!(
-        "  Feature extractor initialized ({})",
-        args.feature_mode.label()
-    ));
-
-    step(&format!(
-        "Scanning LibriSpeech: {} / {}",
-        args.data_dir.display(),
-        args.split
-    ));
-    let utterances = scan_librispeech(&args.data_dir, &args.split, args.max_duration_secs)?;
-    detail(&format!("  Found {} utterances", utterances.len()));
-
-    step("Extracting features");
-    let mut samples = Vec::new();
-    let mut skipped = 0usize;
-    let mut total_oov = 0usize;
-    let total = utterances.len();
-
-    for (i, meta) in utterances.iter().enumerate() {
-        match process_utterance(meta, &extractor, &dict) {
-            Ok(sample) => {
-                total_oov += sample.oov_count;
-                samples.push(sample);
-            }
-            Err(e) => {
-                tracing::debug!("Skipping utterance {}: {e}", meta.audio_path.display());
-                skipped += 1;
-            }
-        }
-        if (i + 1) % 500 == 0 || i + 1 == total {
-            detail(&format!(
-                "  Processed {}/{} (skipped: {}, OOV words: {})",
-                i + 1,
-                total,
-                skipped,
-                total_oov
-            ));
-        }
-    }
-
-    if samples.is_empty() {
-        return Err(Error::config("No valid training samples after processing"));
-    }
-
-    detail(&format!(
-        "  Final: {} samples, {} skipped, {} total OOV words",
-        samples.len(),
-        skipped,
-        total_oov
-    ));
-
-    Ok(samples)
-}
-
-/// Writes one JSON object per line to `training-metrics.jsonl` in the
-/// checkpoint directory, and mirrors each event to `tracing`.
-struct MetricsWriter {
-    file: Option<std::fs::File>,
-    run_start: Instant,
-    elapsed_offset_secs: f64,
-}
-
-impl MetricsWriter {
-    fn new(checkpoint_dir: &Path, append: bool, elapsed_offset_secs: f64) -> Self {
-        let path = checkpoint_dir.join("training-metrics.jsonl");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(!append)
-            .append(append)
-            .open(&path)
-            .ok();
-        if file.is_some() {
-            detail(&format!("  Metrics: {}", path.display()));
-        }
+impl Default for TrainConfig {
+    fn default() -> Self {
         Self {
-            file,
-            run_start: Instant::now(),
-            elapsed_offset_secs,
+            model: SpeechAlignerConfig::default(),
+            epochs: 10,
+            learning_rate: 3e-4,
+            warmup_epochs: 0,
+            batching: Batching::default(),
+            checkpoint_dir: PathBuf::from("checkpoints"),
+            checkpoint_interval: 5,
+            resume_from: None,
+            seed: 42,
         }
     }
+}
 
-    fn elapsed_secs(&self) -> f64 {
-        self.elapsed_offset_secs + self.run_start.elapsed().as_secs_f64()
+#[derive(Debug, Clone)]
+pub struct TrainSummary {
+    /// Mean CTC loss per epoch (sample-weighted), for the epochs run in this
+    /// call. `NaN` for an epoch where every batch was skipped.
+    pub epoch_losses: Vec<f32>,
+    pub final_checkpoint: PathBuf,
+    pub num_params: usize,
+}
+
+/// Learning rate for a 0-based epoch: linear warmup, then cosine decay.
+pub(crate) fn learning_rate_at(base: f64, epoch: usize, total: usize, warmup: usize) -> f64 {
+    if warmup == 0 {
+        return base;
     }
+    if epoch < warmup {
+        return base * (epoch + 1) as f64 / warmup as f64;
+    }
+    let progress = (epoch - warmup) as f64 / (total.saturating_sub(warmup)).max(1) as f64;
+    base * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
+}
 
-    /// Emit a batch-level metric (every N batches).
-    fn emit_batch(
-        &mut self,
-        epoch: usize,
-        batch: usize,
-        total_batches: usize,
-        batch_samples: usize,
-        loss: f32,
-        batch_elapsed_secs: f64,
-    ) {
-        let elapsed = self.elapsed_secs();
-        let samples_per_sec = if batch_elapsed_secs > 0.0 {
-            batch_samples as f64 / batch_elapsed_secs
+/// Train a `SpeechAligner` with CTC loss and save checkpoints to
+/// `config.checkpoint_dir`.
+pub fn train(mut samples: Vec<TrainingSample>, config: &TrainConfig) -> Result<TrainSummary> {
+    validate(&samples, config)?;
+    let device = backend::default_device();
+    error::create_dir_all(&config.checkpoint_dir)?;
+    checkpoint::save_model_config(&config.checkpoint_dir, &config.model)?;
+
+    TrainBackend::seed(&device, config.seed);
+    let mut model: SpeechAligner<TrainBackend> = config.model.init(&device)?;
+    if let Some(path) = &config.resume_from {
+        model = checkpoint::load(model, path, &device)?;
+        tracing::info!("resumed from {}", path.display());
+    }
+    let num_params = model.num_params();
+
+    let resume = collect_resume_state(&config.checkpoint_dir, config.resume_from.as_deref())?;
+    let mut metrics = if resume.completed_epochs > 0 {
+        MetricsWriter::append(&config.checkpoint_dir, resume.elapsed_offset_secs)?
+    } else {
+        MetricsWriter::create(&config.checkpoint_dir)?
+    };
+
+    let plan = plan_batches(&mut samples, config.batching, config.model.n_heads);
+    tracing::info!(
+        "training {num_params} params on {} samples in {} batches, {} epochs, backend {}",
+        samples.len(),
+        plan.len(),
+        config.epochs,
+        backend::BACKEND_NAME
+    );
+
+    let ctc = CTCLossConfig::new().with_zero_infinity(true).init();
+    let mut optimizer = AdamConfig::new().init::<TrainBackend, SpeechAligner<TrainBackend>>();
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let mut order: Vec<usize> = (0..plan.len()).collect();
+    let mut epoch_losses = Vec::with_capacity(config.epochs);
+
+    for epoch_idx in 0..config.epochs {
+        let epoch = resume.completed_epochs + epoch_idx + 1;
+        let lr = learning_rate_at(
+            config.learning_rate,
+            epoch_idx,
+            config.epochs,
+            config.warmup_epochs,
+        );
+        let epoch_start = Instant::now();
+        order.shuffle(&mut rng);
+
+        let (mut loss_sum, mut samples_seen, mut skipped) = (0.0f64, 0usize, 0usize);
+        for (step, &batch_idx) in order.iter().enumerate() {
+            let batch_samples = &samples[plan[batch_idx].clone()];
+            let batch = collate::<TrainBackend>(batch_samples, &device);
+            let output = model.forward_with_pad_mask(batch.inputs, batch.pad_mask);
+            let loss = ctc
+                .forward(
+                    output.ctc_log_probs,
+                    batch.targets,
+                    batch.input_lengths,
+                    batch.target_lengths,
+                )
+                .mean();
+            let loss_value: f32 = loss.clone().into_scalar().elem();
+
+            if loss_value.is_finite() {
+                let grads = GradientsParams::from_grads(loss.backward(), &model);
+                model = optimizer.step(lr, model, grads);
+                loss_sum += f64::from(loss_value) * batch_samples.len() as f64;
+                samples_seen += batch_samples.len();
+            } else {
+                skipped += 1;
+                tracing::warn!(
+                    "epoch {epoch} batch {}: loss is {loss_value}, skipping",
+                    step + 1
+                );
+            }
+
+            if (step + 1) % BATCH_LOG_INTERVAL == 0 {
+                metrics.log(
+                    "batch",
+                    json!({ "epoch": epoch, "batch": step + 1, "batches": plan.len(), "loss": loss_value, "lr": lr }),
+                );
+            }
+        }
+
+        let loss = if samples_seen > 0 {
+            (loss_sum / samples_seen as f64) as f32
         } else {
-            0.0
+            f32::NAN
         };
-
-        // Structured log for monitoring
+        epoch_losses.push(loss);
+        metrics.log(
+            "epoch",
+            json!({
+                "epoch": epoch,
+                "loss": loss,
+                "lr": lr,
+                "skipped_batches": skipped,
+                "epoch_secs": epoch_start.elapsed().as_secs_f64(),
+            }),
+        );
         tracing::info!(
-            target: "training_metrics",
-            event = "batch",
-            epoch = epoch,
-            batch = batch,
-            total_batches = total_batches,
-            batch_samples = batch_samples,
-            loss = loss,
-            samples_per_sec = samples_per_sec,
-            elapsed_secs = elapsed,
-            "training_batch"
+            "epoch {epoch}: loss {loss:.4}, lr {lr:.2e}, {:.1}s",
+            epoch_start.elapsed().as_secs_f64()
         );
 
-        if let Some(ref mut f) = self.file {
-            let _ = writeln!(
-                f,
-                r#"{{"event":"batch","epoch":{epoch},"batch":{batch},"total_batches":{total_batches},"batch_samples":{batch_samples},"loss":{loss:.6},"samples_per_sec":{samples_per_sec:.2},"elapsed_secs":{elapsed:.1}}}"#,
-            );
-            let _ = f.flush();
+        if config.checkpoint_interval > 0 && epoch % config.checkpoint_interval == 0 {
+            let path = config
+                .checkpoint_dir
+                .join(format!("{EPOCH_CHECKPOINT_PREFIX}{epoch}"));
+            checkpoint::save(&model, &path)?;
         }
     }
 
-    /// Emit an epoch-level summary.
-    fn emit_epoch(
-        &mut self,
-        epoch: usize,
-        total_epochs: usize,
-        avg_loss: f32,
-        batch_count: usize,
-        epoch_secs: f64,
-        total_samples: usize,
-    ) {
-        let elapsed = self.elapsed_secs();
-        let remaining_epochs = total_epochs.saturating_sub(epoch);
-        let eta_secs = if epoch > 0 {
-            (elapsed / epoch as f64) * remaining_epochs as f64
-        } else {
-            0.0
-        };
-        let throughput = total_samples as f64 / epoch_secs.max(0.001);
-
-        tracing::info!(
-            target: "training_metrics",
-            event = "epoch",
-            epoch,
-            total_epochs,
-            avg_loss,
-            batch_count,
-            epoch_secs,
-            throughput_samples_per_sec = throughput,
-            elapsed_secs = elapsed,
-            eta_secs,
-            "training_epoch"
-        );
-
-        if let Some(ref mut f) = self.file {
-            let _ = writeln!(
-                f,
-                r#"{{"event":"epoch","epoch":{epoch},"total_epochs":{total_epochs},"avg_loss":{avg_loss:.6},"batches":{batch_count},"epoch_secs":{epoch_secs:.1},"throughput":{throughput:.1},"elapsed_secs":{elapsed:.1},"eta_secs":{eta_secs:.1}}}"#,
-            );
-            let _ = f.flush();
-        }
-
-        detail(&format!(
-            "  epoch {epoch}/{total_epochs} avg_loss={avg_loss:.6} ({batch_count} batches, \
-             {epoch_secs:.1}s, {throughput:.0} samples/s, ETA {eta_secs:.0}s)"
-        ));
+    if epoch_losses.iter().all(|loss| loss.is_nan()) {
+        return Err(Error::training("every batch produced a non-finite loss"));
     }
 
-    /// Emit training completion summary.
-    fn emit_complete(&mut self, epochs: usize, first_loss: f32, last_loss: f32) {
-        let elapsed = self.elapsed_secs();
-        let reduction_pct = if first_loss.abs() > f32::EPSILON {
-            ((first_loss - last_loss) / first_loss) * 100.0
-        } else {
-            0.0
-        };
+    let final_checkpoint = config.checkpoint_dir.join(FINAL_CHECKPOINT);
+    checkpoint::save(&model.valid(), &final_checkpoint)?;
+    metrics.log(
+        "complete",
+        json!({ "epochs": resume.completed_epochs + config.epochs }),
+    );
+    tracing::info!("saved {}", final_checkpoint.display());
 
-        tracing::info!(
-            target: "training_metrics",
-            event = "complete",
-            epochs = epochs,
-            first_loss = first_loss,
-            last_loss = last_loss,
-            reduction_pct = reduction_pct,
-            total_secs = elapsed,
-            "training_complete"
-        );
+    Ok(TrainSummary {
+        epoch_losses,
+        final_checkpoint,
+        num_params,
+    })
+}
 
-        if let Some(ref mut f) = self.file {
-            let _ = writeln!(
-                f,
-                r#"{{"event":"complete","epochs":{epochs},"first_loss":{first_loss:.6},"last_loss":{last_loss:.6},"reduction_pct":{reduction_pct:.1},"total_secs":{elapsed:.1}}}"#,
-            );
-        }
+fn validate(samples: &[TrainingSample], config: &TrainConfig) -> Result<()> {
+    if samples.is_empty() {
+        return Err(Error::config("no training samples"));
     }
+    if config.epochs == 0 {
+        return Err(Error::config("epochs must be > 0"));
+    }
+    if config.learning_rate.is_nan() || config.learning_rate <= 0.0 {
+        return Err(Error::config("learning_rate must be > 0"));
+    }
+    config.batching.validate()?;
+    if let Some(sample) = samples
+        .iter()
+        .find(|s| s.feature_dim != config.model.input_dim)
+    {
+        return Err(Error::config(format!(
+            "samples have feature_dim {} but the model expects input_dim {}",
+            sample.feature_dim, config.model.input_dim
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct ResumeState {
-    pub(super) completed_epochs: usize,
-    pub(super) elapsed_offset_secs: f64,
+    completed_epochs: usize,
+    elapsed_offset_secs: f64,
 }
 
-fn json_usize(value: &Value, key: &str) -> Option<usize> {
-    value
-        .get(key)?
-        .as_u64()
-        .and_then(|raw| usize::try_from(raw).ok())
-}
-
-fn json_f64(value: &Value, key: &str) -> Option<f64> {
-    value.get(key)?.as_f64()
-}
-
-fn checkpoint_epoch_from_name(file_name: &str) -> Option<usize> {
-    file_name
-        .strip_prefix("speech-aligner-epoch-")?
-        .parse::<usize>()
+fn checkpoint_epoch(path: &Path) -> Option<usize> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix(EPOCH_CHECKPOINT_PREFIX)?
+        .parse()
         .ok()
-}
-
-fn checkpoint_epoch_from_path(path: &Path) -> Option<usize> {
-    checkpoint_epoch_from_name(path.file_name()?.to_str()?)
 }
 
 /// Work out how many epochs a resumed run has already completed.
 ///
-/// A fresh run (`resume_from == None`) always starts at epoch 0, even if
-/// the checkpoint directory holds files from an earlier run. When resuming
-/// from `speech-aligner-epoch-N`, N is authoritative; later checkpoints in
-/// the same directory are ignored. Elapsed time is read from the metrics
-/// lines up to that epoch.
+/// A fresh run (`resume_from == None`) always starts at epoch 0, even if the
+/// directory holds files from an earlier run. When resuming from
+/// `speech-aligner-epoch-N`, N is authoritative. For any other checkpoint
+/// name (e.g. `speech-aligner-final`) the newest epoch recorded in the
+/// directory is used. Elapsed time comes from the metrics lines up to that
+/// epoch.
 fn collect_resume_state(checkpoint_dir: &Path, resume_from: Option<&Path>) -> Result<ResumeState> {
     let mut state = ResumeState::default();
     let Some(resume_path) = resume_from else {
         return Ok(state);
     };
-    let resume_epoch = checkpoint_epoch_from_path(resume_path);
+    let resume_epoch = checkpoint_epoch(resume_path);
 
     if let Some(epoch) = resume_epoch {
         state.completed_epochs = epoch;
     } else if let Ok(entries) = std::fs::read_dir(checkpoint_dir) {
-        // Resuming from a non-epoch checkpoint (e.g. `speech-aligner-final`):
-        // fall back to the newest epoch checkpoint in the directory.
-        for entry in entries {
-            let entry = entry.map_err(|err| {
-                Error::process(format!(
-                    "Failed to read checkpoint dir {}: {err}",
-                    checkpoint_dir.display()
-                ))
-            })?;
-            let file_name = entry.file_name();
-            let Some(file_name) = file_name.to_str() else {
-                continue;
-            };
-            if let Some(epoch) = checkpoint_epoch_from_name(file_name) {
+        for entry in entries.flatten() {
+            if let Some(epoch) = checkpoint_epoch(&entry.path()) {
                 state.completed_epochs = state.completed_epochs.max(epoch);
             }
         }
     }
 
-    let metrics_path = checkpoint_dir.join("training-metrics.jsonl");
-    if let Ok(file) = std::fs::File::open(&metrics_path) {
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let line = line.map_err(|err| {
-                Error::process(format!(
-                    "Failed to read metrics file {}: {err}",
-                    metrics_path.display()
-                ))
-            })?;
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-
-            let line_epoch = json_usize(&value, "epoch").or_else(|| json_usize(&value, "epochs"));
-            if resume_epoch.is_none() {
-                if let Some(epoch) = line_epoch {
-                    state.completed_epochs = state.completed_epochs.max(epoch);
-                }
-            }
-            if line_epoch.is_some_and(|epoch| epoch > state.completed_epochs) {
-                continue;
-            }
-
-            if let Some(elapsed_secs) =
-                json_f64(&value, "elapsed_secs").or_else(|| json_f64(&value, "total_secs"))
-            {
-                state.elapsed_offset_secs = state.elapsed_offset_secs.max(elapsed_secs);
+    let metrics_path = checkpoint_dir.join(METRICS_FILE);
+    let Ok(file) = std::fs::File::open(&metrics_path) else {
+        return Ok(state);
+    };
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|err| Error::io(&metrics_path, err))?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let line_epoch = ["epoch", "epochs"]
+            .iter()
+            .find_map(|key| value.get(*key)?.as_u64())
+            .map(|epoch| epoch as usize);
+        if resume_epoch.is_none() {
+            if let Some(epoch) = line_epoch {
+                state.completed_epochs = state.completed_epochs.max(epoch);
             }
         }
+        if line_epoch.is_some_and(|epoch| epoch > state.completed_epochs) {
+            continue;
+        }
+        if let Some(elapsed) = value.get("elapsed_secs").and_then(Value::as_f64) {
+            state.elapsed_offset_secs = state.elapsed_offset_secs.max(elapsed);
+        }
     }
-
     Ok(state)
-}
-
-/// Generic training loop that works with any Burn backend.
-fn train_loop<TrainB, InferB>(
-    args: &TrainRealArgs,
-    mut samples: Vec<crate::dataset::TrainingSample>,
-    device: &TrainB::Device,
-    backend_name: &str,
-) -> Result<()>
-where
-    TrainB: AutodiffBackend,
-    InferB: Backend<FloatElem = f32>,
-    SpeechAligner<TrainB>: AutodiffModule<TrainB, InnerModule = SpeechAligner<InferB>>,
-{
-    step(&format!(
-        "Training ({} epochs, batch_size={}, lr={}, backend={})",
-        args.epochs, args.batch_size, args.learning_rate, backend_name
-    ));
-
-    TrainB::seed(device, 42);
-
-    let config = SpeechAlignerConfig::for_feature_mode(args.feature_mode);
-    let mut model: SpeechAligner<TrainB> = config.init(device)?;
-    let loss_fn = SpeechAlignerLossConfig::init();
-    let mut optimizer = AdamConfig::new().init::<TrainB, SpeechAligner<TrainB>>();
-
-    let param_count = model.num_params();
-    detail(&format!("  Model parameters: {param_count}"));
-
-    std::fs::create_dir_all(&args.checkpoint_dir).map_err(|e| {
-        Error::process(format!(
-            "Failed to create checkpoint dir {}: {e}",
-            args.checkpoint_dir.display()
-        ))
-    })?;
-
-    let mut epoch_losses = Vec::new();
-    let mut metrics = MetricsWriter::new(&args.checkpoint_dir, false, 0.0);
-    let total_samples = samples.len();
-
-    for epoch in 0..args.epochs {
-        let epoch_start = Instant::now();
-        let mut batches = create_batches::<TrainB>(&mut samples, args.batch_size, device);
-
-        if epoch % 2 == 1 {
-            batches.reverse();
-        }
-
-        let num_batches = batches.len();
-        let mut epoch_loss_sum = 0.0f64;
-        let mut batch_count = 0usize;
-
-        for (batch_idx, batch) in batches.into_iter().enumerate() {
-            let batch_start = Instant::now();
-            let batch_size = batch.input_lengths.dims()[0];
-            let output = model.forward_with_pad_mask(batch.inputs, batch.pad_mask);
-            let loss_per_sample = loss_fn.forward(
-                output.ctc_log_probs,
-                batch.targets,
-                batch.input_lengths,
-                batch.target_lengths,
-            );
-            let loss = loss_per_sample.clone().mean();
-
-            let loss_data = loss.clone().to_data();
-            let loss_val: f32 = loss_data
-                .to_vec::<f32>()
-                .map_err(|e| Error::config(format!("Loss extraction failed: {e}")))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::config("Empty loss tensor"))?;
-
-            if loss_val.is_finite() {
-                epoch_loss_sum += f64::from(loss_val);
-                batch_count += 1;
-
-                let grads = loss.backward();
-                let grads = GradientsParams::from_grads(grads, &model);
-                model = optimizer.step(args.learning_rate, model, grads);
-            } else {
-                tracing::warn!(
-                    "Non-finite loss at epoch {}, batch {}: {loss_val} — skipping update",
-                    epoch + 1,
-                    batch_idx + 1
-                );
-            }
-
-            if (batch_idx + 1) % 50 == 0 || batch_idx + 1 == num_batches {
-                let batch_secs = batch_start.elapsed().as_secs_f64();
-                metrics.emit_batch(
-                    epoch + 1,
-                    batch_idx + 1,
-                    num_batches,
-                    batch_size,
-                    loss_val,
-                    batch_secs,
-                );
-            }
-        }
-
-        let avg_loss = if batch_count > 0 {
-            (epoch_loss_sum / batch_count as f64) as f32
-        } else {
-            f32::NAN
-        };
-        epoch_losses.push(avg_loss);
-
-        let epoch_secs = epoch_start.elapsed().as_secs_f64();
-        metrics.emit_epoch(
-            epoch + 1,
-            args.epochs,
-            avg_loss,
-            batch_count,
-            epoch_secs,
-            total_samples,
-        );
-
-        if args.checkpoint_interval > 0 && (epoch + 1) % args.checkpoint_interval == 0 {
-            let ckpt_path = args
-                .checkpoint_dir
-                .join(format!("speech-aligner-epoch-{}", epoch + 1));
-            save_model_checkpoint(&model, &ckpt_path)?;
-            detail(&format!("  Checkpoint saved: {}", ckpt_path.display()));
-        }
-    }
-
-    // Final checkpoint (inference model)
-    let model_infer: SpeechAligner<InferB> = model.valid();
-    let final_ckpt = args.checkpoint_dir.join("speech-aligner-final");
-    save_model_checkpoint(&model_infer, &final_ckpt)?;
-
-    tracing::info!("");
-    success(&format!(
-        "Training complete: {} epochs, {} samples, final checkpoint at {}",
-        args.epochs,
-        total_samples,
-        final_ckpt.display()
-    ));
-
-    if let (Some(&first), Some(&last)) = (epoch_losses.first(), epoch_losses.last()) {
-        if first.is_finite() && last.is_finite() && first.abs() > f32::EPSILON {
-            metrics.emit_complete(args.epochs, first, last);
-            let pct = ((first - last) / first) * 100.0;
-            detail(&format!(
-                "  Loss: {first:.4} -> {last:.4} ({pct:.1}% reduction)"
-            ));
-        }
-    }
-
-    let report = generate_training_report(
-        args,
-        &epoch_losses,
-        param_count,
-        total_samples,
-        backend_name,
-    );
-    let report_path = args.checkpoint_dir.join("train-real-report.md");
-    std::fs::write(&report_path, &report)
-        .map_err(|e| Error::process(format!("Failed to write report: {e}")))?;
-    detail(&format!("  Report: {}", report_path.display()));
-
-    Ok(())
-}
-
-/// Save a model checkpoint (works with both training and inference models).
-fn save_model_checkpoint<B: Backend>(model: &SpeechAligner<B>, path: &Path) -> Result<()> {
-    let recorder = BinBytesRecorder::<FullPrecisionSettings>::default();
-    let record = model.clone().into_record();
-    let bytes = recorder
-        .record(record, ())
-        .map_err(|e| Error::process(format!("Failed to serialize checkpoint: {e}")))?;
-    std::fs::write(path, &bytes).map_err(|e| {
-        Error::process(format!(
-            "Failed to write checkpoint to {}: {e}",
-            path.display()
-        ))
-    })?;
-    Ok(())
-}
-
-fn generate_training_report(
-    args: &TrainRealArgs,
-    losses: &[f32],
-    params: usize,
-    num_samples: usize,
-    backend_name: &str,
-) -> String {
-    use std::fmt::Write as _;
-
-    let mut report = String::new();
-    report.push_str("# SpeechAligner Real-Data Training Report\n\n");
-    let _ = writeln!(
-        report,
-        "**Date**: {}",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
-    );
-    let _ = writeln!(report, "**Backend**: {backend_name}");
-    report.push_str("**Model**: SpeechAligner\n");
-    let _ = writeln!(report, "**Parameters**: {params}");
-    let _ = writeln!(report, "**Dataset**: {}", args.data_dir.display());
-    let _ = writeln!(report, "**Split**: {}", args.split);
-    let _ = writeln!(report, "**Samples**: {num_samples}");
-    let _ = writeln!(report, "**Epochs**: {}", args.epochs);
-    let _ = writeln!(report, "**Batch Size**: {}", args.batch_size);
-    let _ = writeln!(report, "**Learning Rate**: {}", args.learning_rate);
-    let _ = writeln!(
-        report,
-        "**Checkpoint**: {}\n",
-        args.checkpoint_dir.display()
-    );
-    report.push_str("---\n\n## Loss Curve\n\n");
-    report.push_str("| Epoch | Avg Loss |\n|---|---|\n");
-    for (i, l) in losses.iter().enumerate() {
-        let _ = writeln!(report, "| {} | {l:.6} |", i + 1);
-    }
-    report
-}
-
-fn generate_precomputed_training_report(
-    args: &TrainPrecomputedArgs,
-    manifest: &PrecomputedManifest,
-    losses: &[f32],
-    params: usize,
-    num_samples: usize,
-    backend_name: &str,
-    attention_heads: usize,
-) -> String {
-    use std::fmt::Write as _;
-
-    let mut report = String::new();
-    report.push_str("# SpeechAligner Precomputed Training Report\n\n");
-    let _ = writeln!(
-        report,
-        "**Date**: {}",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
-    );
-    let _ = writeln!(report, "**Backend**: {backend_name}");
-    report.push_str("**Model**: SpeechAligner\n");
-    let _ = writeln!(report, "**Parameters**: {params}");
-    let _ = writeln!(report, "**Cache Dir**: {}", args.cache_dir.display());
-    let _ = writeln!(report, "**Source Data**: {}", manifest.data_dir);
-    let _ = writeln!(report, "**Split**: {}", manifest.split);
-    let duration_cap = manifest.max_duration_secs.map_or_else(
-        || "unknown (legacy manifest)".to_owned(),
-        |secs| format!("{secs:.1}s"),
-    );
-    let _ = writeln!(report, "**Duration Cap**: {duration_cap}");
-    let _ = writeln!(report, "**Samples**: {num_samples}");
-    let _ = writeln!(report, "**Total Frames**: {}", manifest.total_frames);
-    let _ = writeln!(report, "**Feature Dim**: {}", manifest.feature_dim);
-    let _ = writeln!(report, "**Total OOV**: {}", manifest.total_oov);
-    let _ = writeln!(report, "**Epochs**: {}", args.epochs);
-    let _ = writeln!(report, "**Attention Heads**: {attention_heads}");
-    let _ = writeln!(
-        report,
-        "**Max Attention Elements**: {}",
-        args.max_attn_elements
-    );
-    let _ = writeln!(
-        report,
-        "**Max Samples Per Batch**: {}",
-        args.max_samples_per_batch
-    );
-    let _ = writeln!(report, "**Learning Rate**: {}", args.learning_rate);
-    let _ = writeln!(report, "**Checkpoint**: {}", args.checkpoint_dir.display());
-    if let Some(ref resume_path) = args.resume_from {
-        let _ = writeln!(report, "**Resume From**: {}", resume_path.display());
-    }
-    report.push_str(
-        "\n---\n\n## Batching Strategy\n\n- Attention-aware dynamic batching (`B × heads × \
-         T²`)\n- Precomputed feature cache\n\n## Loss Curve\n\n",
-    );
-    report.push_str("| Epoch | Avg Loss |\n|---|---|\n");
-    for (i, loss) in losses.iter().enumerate() {
-        let _ = writeln!(report, "| {} | {loss:.6} |", i + 1);
-    }
-    report
-}
-
-/// Arguments for precomputed training (fast ablation mode).
-pub struct TrainPrecomputedArgs {
-    /// Directory containing precomputed binary cache + manifest.json.
-    pub cache_dir: std::path::PathBuf,
-    /// Number of training epochs.
-    pub epochs: usize,
-    /// Max attention score elements per batch (`B × heads × T²`). Controls
-    /// GPU memory: higher → bigger batches → faster. Default 500M is
-    /// safe for 80 GB GPUs (~6 GB peak with backward pass).
-    pub max_attn_elements: usize,
-    /// Hard cap on samples per batch (even if memory budget allows more).
-    pub max_samples_per_batch: usize,
-    /// Learning rate.
-    pub learning_rate: f64,
-    /// Directory for checkpoint output.
-    pub checkpoint_dir: std::path::PathBuf,
-    /// Save checkpoint every N epochs (0 = only final).
-    pub checkpoint_interval: usize,
-    /// Optional: resume from this checkpoint path.
-    pub resume_from: Option<std::path::PathBuf>,
-}
-
-/// Execute training from precomputed feature cache.
-///
-/// This is the fast training path: no audio loading, no FFT,
-/// no MFCC extraction. Just tensor loading → GPU training.
-pub fn execute_train_precomputed(args: &TrainPrecomputedArgs) -> Result<()> {
-    if args.max_attn_elements == 0 {
-        return Err(Error::config("max_attn_elements must be > 0"));
-    }
-    if args.max_samples_per_batch == 0 {
-        return Err(Error::config("max_samples_per_batch must be > 0"));
-    }
-
-    section("SpeechAligner Precomputed Training");
-
-    // 1. Load precomputed samples
-    step("Loading precomputed features");
-    let (manifest, samples) = crate::precompute::load_precomputed(&args.cache_dir)?;
-    detail(&format!(
-        "  {} samples, {} total frames, feature_dim={}",
-        manifest.num_samples, manifest.total_frames, manifest.feature_dim
-    ));
-    detail(&format!(
-        "  Attention-aware batching: max_attn_elements={}, max_samples={}",
-        args.max_attn_elements, args.max_samples_per_batch
-    ));
-    if let Some(max_duration_secs) = manifest.max_duration_secs {
-        detail(&format!("  Cache duration cap: {max_duration_secs:.1}s"));
-    } else {
-        detail("  Cache duration cap: unknown (legacy manifest)");
-    }
-
-    // 2. Dispatch to backend
-    #[cfg(feature = "cuda")]
-    {
-        use burn::backend::cuda::CudaDevice;
-        use burn::backend::{Autodiff, Cuda};
-
-        type TrainB = Autodiff<Cuda>;
-        type InferB = Cuda;
-
-        let device = CudaDevice::default();
-        detail("  Backend: Autodiff<Cuda> (CUDA GPU)");
-        precomputed_train_loop::<TrainB, InferB>(
-            args,
-            &manifest,
-            samples,
-            &device,
-            "Autodiff<Cuda> (CUDA GPU)",
-        )
-    }
-
-    #[cfg(all(feature = "wgpu", not(feature = "cuda")))]
-    {
-        use burn::backend::wgpu::{Wgpu, WgpuDevice};
-        use burn::backend::Autodiff;
-
-        type TrainB = Autodiff<Wgpu>;
-        type InferB = Wgpu;
-
-        let device = WgpuDevice::default();
-        detail("  Backend: Autodiff<Wgpu> (Vulkan/Metal GPU)");
-        precomputed_train_loop::<TrainB, InferB>(
-            args,
-            &manifest,
-            samples,
-            &device,
-            "Autodiff<Wgpu> (Vulkan/Metal GPU)",
-        )
-    }
-
-    #[cfg(not(any(feature = "cuda", feature = "wgpu")))]
-    {
-        use burn::backend::ndarray::NdArrayDevice;
-        use burn::backend::{Autodiff, NdArray};
-
-        type TrainB = Autodiff<NdArray>;
-        type InferB = NdArray;
-
-        let device = NdArrayDevice::default();
-        detail("  Backend: Autodiff<NdArray> (CPU)");
-        precomputed_train_loop::<TrainB, InferB>(
-            args,
-            &manifest,
-            samples,
-            &device,
-            "Autodiff<NdArray> (CPU)",
-        )
-    }
-}
-
-/// Training loop for precomputed data — same core as `train_loop` but
-/// with checkpoint resumption and optimized defaults.
-fn precomputed_train_loop<TrainB, InferB>(
-    args: &TrainPrecomputedArgs,
-    manifest: &PrecomputedManifest,
-    mut samples: Vec<crate::dataset::TrainingSample>,
-    device: &TrainB::Device,
-    backend_name: &str,
-) -> Result<()>
-where
-    TrainB: AutodiffBackend,
-    InferB: Backend<FloatElem = f32>,
-    SpeechAligner<TrainB>: AutodiffModule<TrainB, InnerModule = SpeechAligner<InferB>>,
-{
-    step(&format!(
-        "Training: {} epochs, max_attn_elements={}, max_samples={}, lr={}, backend={}",
-        args.epochs,
-        args.max_attn_elements,
-        args.max_samples_per_batch,
-        args.learning_rate,
-        backend_name
-    ));
-
-    TrainB::seed(device, 42);
-
-    let config = SpeechAlignerConfig::with_input_dim(manifest.feature_dim);
-    let attention_heads = config.n_heads;
-    let mut model: SpeechAligner<TrainB> = config.init(device)?;
-
-    // Resume from checkpoint if provided
-    if let Some(ref resume_path) = args.resume_from {
-        step(&format!("Resuming from {}", resume_path.display()));
-        let bytes = std::fs::read(resume_path).map_err(|e| {
-            Error::config(format!(
-                "Cannot read checkpoint {}: {e}",
-                resume_path.display()
-            ))
-        })?;
-        let recorder = BinBytesRecorder::<FullPrecisionSettings>::default();
-        let record = recorder
-            .load(bytes, device)
-            .map_err(|e| Error::process(format!("Failed to load checkpoint: {e}")))?;
-        model = model.load_record(record);
-        detail("  Checkpoint loaded — continuing training");
-    }
-
-    let loss_fn = SpeechAlignerLossConfig::init();
-    let mut optimizer = AdamConfig::new().init::<TrainB, SpeechAligner<TrainB>>();
-
-    let param_count = model.num_params();
-    detail(&format!("  Model parameters: {param_count}"));
-
-    std::fs::create_dir_all(&args.checkpoint_dir).map_err(|e| {
-        Error::process(format!(
-            "Failed to create checkpoint dir {}: {e}",
-            args.checkpoint_dir.display()
-        ))
-    })?;
-
-    let resume_state = collect_resume_state(&args.checkpoint_dir, args.resume_from.as_deref())?;
-    if resume_state.completed_epochs > 0 {
-        detail(&format!(
-            "  Resume offset: {} prior epochs, {:.1}s prior elapsed",
-            resume_state.completed_epochs, resume_state.elapsed_offset_secs
-        ));
-    }
-
-    let mut epoch_losses = Vec::new();
-    let mut metrics = MetricsWriter::new(
-        &args.checkpoint_dir,
-        resume_state.completed_epochs > 0,
-        resume_state.elapsed_offset_secs,
-    );
-    let total_samples = samples.len();
-    let total_epochs_planned = resume_state.completed_epochs + args.epochs;
-
-    for epoch in 0..args.epochs {
-        let epoch_num = resume_state.completed_epochs + epoch + 1;
-        let epoch_start = Instant::now();
-        let mut batches = create_dynamic_batches::<TrainB>(
-            &mut samples,
-            args.max_attn_elements,
-            args.max_samples_per_batch,
-            attention_heads,
-            device,
-        );
-
-        if epoch == 0 {
-            detail(&format!(
-                "  Dynamic batching: {} batches this epoch",
-                batches.len()
-            ));
-            if let (Some(first), Some(last)) = (batches.first(), batches.last()) {
-                let first_size = first.input_lengths.dims()[0];
-                let last_size = last.input_lengths.dims()[0];
-                detail(&format!(
-                    "  First batch: {first_size} samples (short), last batch: {last_size} \
-                     samples (long)"
-                ));
-            }
-        }
-
-        // Alternate sort direction for regularization
-        if epoch % 2 == 1 {
-            batches.reverse();
-        }
-
-        let num_batches = batches.len();
-        let mut epoch_loss_sum = 0.0f64;
-        let mut batch_count = 0usize;
-
-        for (batch_idx, batch) in batches.into_iter().enumerate() {
-            let batch_start = Instant::now();
-            let batch_size = batch.input_lengths.dims()[0];
-            let output = model.forward_with_pad_mask(batch.inputs, batch.pad_mask);
-            let loss_per_sample = loss_fn.forward(
-                output.ctc_log_probs,
-                batch.targets,
-                batch.input_lengths,
-                batch.target_lengths,
-            );
-            let loss = loss_per_sample.clone().mean();
-
-            let loss_data = loss.clone().to_data();
-            let loss_val: f32 = loss_data
-                .to_vec::<f32>()
-                .map_err(|e| Error::config(format!("Loss extraction failed: {e}")))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::config("Empty loss tensor"))?;
-
-            if loss_val.is_finite() {
-                epoch_loss_sum += f64::from(loss_val);
-                batch_count += 1;
-
-                let grads = loss.backward();
-                let grads = GradientsParams::from_grads(grads, &model);
-                model = optimizer.step(args.learning_rate, model, grads);
-            } else {
-                tracing::warn!(
-                    "Non-finite loss at epoch {}, batch {}: {loss_val} — skipping",
-                    epoch_num,
-                    batch_idx + 1
-                );
-            }
-
-            if (batch_idx + 1) % 10 == 0 || batch_idx + 1 == num_batches {
-                let batch_secs = batch_start.elapsed().as_secs_f64();
-                metrics.emit_batch(
-                    epoch_num,
-                    batch_idx + 1,
-                    num_batches,
-                    batch_size,
-                    loss_val,
-                    batch_secs,
-                );
-            }
-        }
-
-        let avg_loss = if batch_count > 0 {
-            (epoch_loss_sum / batch_count as f64) as f32
-        } else {
-            f32::NAN
-        };
-        epoch_losses.push(avg_loss);
-
-        let epoch_secs = epoch_start.elapsed().as_secs_f64();
-        metrics.emit_epoch(
-            epoch_num,
-            total_epochs_planned,
-            avg_loss,
-            batch_count,
-            epoch_secs,
-            total_samples,
-        );
-
-        if args.checkpoint_interval > 0 && epoch_num % args.checkpoint_interval == 0 {
-            let ckpt_path = args
-                .checkpoint_dir
-                .join(format!("speech-aligner-epoch-{epoch_num}"));
-            save_model_checkpoint(&model, &ckpt_path)?;
-            detail(&format!("  Checkpoint saved: {}", ckpt_path.display()));
-        }
-    }
-
-    // Final checkpoint (inference model)
-    let model_infer: SpeechAligner<InferB> = model.valid();
-    let final_ckpt = args.checkpoint_dir.join("speech-aligner-final");
-    save_model_checkpoint(&model_infer, &final_ckpt)?;
-
-    tracing::info!("");
-    success(&format!(
-        "Training complete: {} total epochs ({} this leg), {} samples, attention-aware \
-         batching (max_attn_elements={}), checkpoint at {}",
-        total_epochs_planned,
-        args.epochs,
-        total_samples,
-        args.max_attn_elements,
-        final_ckpt.display()
-    ));
-
-    if let (Some(&first), Some(&last)) = (epoch_losses.first(), epoch_losses.last()) {
-        if first.is_finite() && last.is_finite() && first.abs() > f32::EPSILON {
-            metrics.emit_complete(total_epochs_planned, first, last);
-            let pct = ((first - last) / first) * 100.0;
-            detail(&format!(
-                "  Loss: {first:.4} -> {last:.4} ({pct:.1}% reduction)"
-            ));
-        }
-    }
-
-    let report = generate_precomputed_training_report(
-        args,
-        manifest,
-        &epoch_losses,
-        param_count,
-        total_samples,
-        backend_name,
-        attention_heads,
-    );
-    let report_path = args.checkpoint_dir.join("train-precomputed-report.md");
-    std::fs::write(&report_path, &report)
-        .map_err(|e| Error::process(format!("Failed to write report: {e}")))?;
-    detail(&format!("  Report: {}", report_path.display()));
-
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use tempfile::tempdir;
 
     use super::*;
 
+    fn tiny_model() -> SpeechAlignerConfig {
+        SpeechAlignerConfig {
+            input_dim: 4,
+            num_classes: 6,
+            n_heads: 1,
+            se_reduction: 2,
+            channels: [4, 4, 4, 8],
+            kernel_size: 3,
+        }
+    }
+
+    fn sample(frames: usize, offset: f32) -> TrainingSample {
+        TrainingSample {
+            features: (0..frames * 4)
+                .map(|i| ((i % 7) as f32 + offset) * 0.1)
+                .collect(),
+            feature_dim: 4,
+            targets: vec![1, 2, 3],
+            oov_words: 0,
+        }
+    }
+
     #[test]
-    fn test_collect_resume_state_uses_resume_checkpoint_epoch() {
-        let tempdir = tempdir().expect("tempdir");
-        let checkpoint_dir = tempdir.path();
+    fn learning_rate_schedule() {
+        assert_eq!(learning_rate_at(1.0, 5, 10, 0), 1.0);
+        assert!((learning_rate_at(1.0, 0, 10, 2) - 0.5).abs() < 1e-12);
+        assert!((learning_rate_at(1.0, 1, 10, 2) - 1.0).abs() < 1e-12);
+        assert!((learning_rate_at(1.0, 2, 10, 2) - 1.0).abs() < 1e-12);
+        assert!(learning_rate_at(1.0, 9, 10, 2) < 0.1);
+    }
+
+    #[test]
+    fn rejects_mismatched_feature_dim() {
+        let mut bad = sample(20, 0.0);
+        bad.feature_dim = 2;
+        let config = TrainConfig {
+            model: tiny_model(),
+            ..TrainConfig::default()
+        };
+        let err = train(vec![bad], &config).expect_err("mismatch");
+        assert!(err.to_string().contains("feature_dim"), "{err}");
+    }
+
+    #[test]
+    fn loss_decreases_and_checkpoints_are_written() {
+        let dir = tempdir().expect("tempdir");
+        let config = TrainConfig {
+            model: tiny_model(),
+            epochs: 8,
+            learning_rate: 1e-2,
+            batching: Batching::Fixed { batch_size: 2 },
+            checkpoint_dir: dir.path().to_path_buf(),
+            checkpoint_interval: 4,
+            ..TrainConfig::default()
+        };
+        let samples = vec![sample(20, 0.0), sample(24, 1.0), sample(16, 2.0)];
+
+        let summary = train(samples, &config).expect("train");
+        let first = summary.epoch_losses[0];
+        let last = *summary.epoch_losses.last().expect("losses");
+        assert!(last < first, "loss should fall: {first} -> {last}");
+        for name in [
+            "speech-aligner-epoch-4",
+            "speech-aligner-epoch-8",
+            FINAL_CHECKPOINT,
+            METRICS_FILE,
+            "model-config.json",
+        ] {
+            assert!(dir.path().join(name).exists(), "{name} missing");
+        }
+
+        // The final checkpoint loads back into the same architecture.
+        let device = backend::default_device();
+        let model = tiny_model()
+            .init::<backend::InferBackend>(&device)
+            .expect("init");
+        checkpoint::load(model, &summary.final_checkpoint, &device).expect("reload");
+    }
+
+    #[test]
+    fn resume_state_uses_resume_checkpoint_epoch() {
+        let dir = tempdir().expect("tempdir");
         std::fs::write(
-            checkpoint_dir.join("training-metrics.jsonl"),
+            dir.path().join(METRICS_FILE),
             concat!(
                 "{\"event\":\"epoch\",\"epoch\":2,\"elapsed_secs\":18.0}\n",
                 "{\"event\":\"batch\",\"epoch\":2,\"elapsed_secs\":20.0}\n",
@@ -1041,15 +409,11 @@ mod tests {
             ),
         )
         .expect("write metrics");
-        std::fs::write(checkpoint_dir.join("speech-aligner-epoch-3"), b"")
-            .expect("write checkpoint");
+        std::fs::write(dir.path().join("speech-aligner-epoch-3"), b"").expect("write");
 
-        let state = collect_resume_state(
-            checkpoint_dir,
-            Some(Path::new("/tmp/speech-aligner-epoch-2")),
-        )
-        .expect("resume state");
-
+        let state =
+            collect_resume_state(dir.path(), Some(Path::new("/tmp/speech-aligner-epoch-2")))
+                .expect("state");
         assert_eq!(
             state,
             ResumeState {
@@ -1060,30 +424,21 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_resume_state_falls_back_to_newest_epoch() {
-        let tempdir = tempdir().expect("tempdir");
-        let checkpoint_dir = tempdir.path();
-        std::fs::write(checkpoint_dir.join("speech-aligner-epoch-3"), b"")
-            .expect("write checkpoint");
-
-        let state = collect_resume_state(
-            checkpoint_dir,
-            Some(&checkpoint_dir.join("speech-aligner-final")),
-        )
-        .expect("resume state");
-
+    fn resume_state_falls_back_to_newest_epoch() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("speech-aligner-epoch-3"), b"").expect("write");
+        let state = collect_resume_state(dir.path(), Some(&dir.path().join(FINAL_CHECKPOINT)))
+            .expect("state");
         assert_eq!(state.completed_epochs, 3);
     }
 
     #[test]
-    fn test_collect_resume_state_ignores_old_run_without_resume() {
-        let tempdir = tempdir().expect("tempdir");
-        let checkpoint_dir = tempdir.path();
-        std::fs::write(checkpoint_dir.join("speech-aligner-epoch-7"), b"")
-            .expect("write checkpoint");
-
-        let state = collect_resume_state(checkpoint_dir, None).expect("resume state");
-
-        assert_eq!(state, ResumeState::default());
+    fn fresh_run_ignores_old_checkpoints() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("speech-aligner-epoch-7"), b"").expect("write");
+        assert_eq!(
+            collect_resume_state(dir.path(), None).expect("state"),
+            ResumeState::default()
+        );
     }
 }

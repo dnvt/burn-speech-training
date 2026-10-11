@@ -1,1051 +1,487 @@
-//! Evaluate a `SpeechAligner` checkpoint against `SpeechOcean762` word-level
-//! human scores. Computes CTC-based GOP and reports Spearman correlation.
+//! Evaluate a checkpoint against SpeechOcean762 word scores.
+//!
+//! Four goodness-of-pronunciation (GOP) baselines are computed from the CTC
+//! output, plus the fine-tuned scoring head when one is given. Each method
+//! is reported as Spearman ρ against the human scores, with a 95% bootstrap
+//! interval resampled by utterance.
+//!
+//! Word boundaries are not known, so every method uses the same
+//! approximation as training: an utterance's frames are split evenly among
+//! its words ([`proportional_word_frame_span`]).
 
-use std::path::{Path, PathBuf};
+use std::fmt::Write as _;
+use std::path::PathBuf;
 
-use burn::module::Module;
-use burn::record::{BinBytesRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
-use serde::Deserialize;
+use burn::tensor::{Shape, Tensor, TensorData};
 
-use crate::dataset::load_audio_samples;
+use crate::backend::{self, InferBackend};
+use crate::checkpoint;
+use crate::data::{audio, so762};
 use crate::error::{Error, Result};
-use crate::finetune::{
-    load_scoring_head_checkpoint, load_scoring_head_config, load_teacher_feature_cache,
-    scoring_input_dim_from_config, scoring_predictions_from_logits, ScoringHead, ScoringHeadConfig,
-    ScoringInputSource,
-};
+use crate::finetune::head::{InputSource, ScoringHead};
 use crate::mfcc::{FeatureMode, MfccExtractor};
-use crate::model::{proportional_word_frame_span, SpeechAligner, SpeechAlignerConfig};
-use crate::phoneme_map::arpabet_to_idx;
-use crate::ui::{detail, section, step};
+use crate::model::proportional_word_frame_span;
+use crate::phoneme_map::{arpabet_to_idx, BLANK_IDX};
+use crate::stats::Correlation;
 
-#[derive(Deserialize)]
-struct WordDataset {
-    samples: Vec<WordSample>,
-}
+const BOOTSTRAP_SAMPLES: usize = 2000;
+/// Score given to a target phoneme that never appears in the best path.
+const GOP_SA_DELETION_SCORE: f64 = -20.0;
 
-#[derive(Deserialize)]
-struct WordSample {
-    human_score: f64,
-    audio_file: String,
-    phonemes: Vec<String>,
-    word_position: usize,
-    sentence_text: String,
-}
-
-struct EvaluationMetric {
-    name: &'static str,
-    rho: f64,
-    pcc: f64,
-    ci: (f64, f64),
-    words_scored: usize,
-    description: &'static str,
-}
-
-struct MetricAccumulator {
-    name: &'static str,
-    description: &'static str,
-    predicted: Vec<f64>,
-    human: Vec<f64>,
-}
-
-impl MetricAccumulator {
-    fn new(name: &'static str, description: &'static str, capacity: usize) -> Self {
-        Self {
-            name,
-            description,
-            predicted: Vec::with_capacity(capacity),
-            human: Vec::with_capacity(capacity),
-        }
-    }
-
-    fn push(&mut self, predicted: f64, human: f64) {
-        self.predicted.push(predicted);
-        self.human.push(human);
-    }
-
-    fn words_scored(&self) -> usize {
-        self.predicted.len().min(self.human.len())
-    }
-
-    fn finalize(&self) -> Option<EvaluationMetric> {
-        let words_scored = self.words_scored();
-        if words_scored == 0 {
-            return None;
-        }
-        Some(EvaluationMetric {
-            name: self.name,
-            rho: spearman_rho(&self.predicted, &self.human),
-            pcc: pearson_r(&self.predicted, &self.human),
-            ci: bootstrap_ci_95(&self.predicted, &self.human, 2000),
-            words_scored,
-            description: self.description,
-        })
-    }
-}
-
-/// Arguments for checkpoint evaluation.
-pub struct EvaluateArgs {
+#[derive(Debug, Clone)]
+pub struct EvaluateConfig {
     pub checkpoint: PathBuf,
+    /// Scoring head from [`crate::finetune::finetune`]; its saved config
+    /// overrides `feature_mode`.
     pub scoring_head: Option<PathBuf>,
+    /// Word-score JSON (see [`crate::data::so762`]); needs `phonemes` for the
+    /// GOP methods.
     pub dataset: PathBuf,
     pub data_root: PathBuf,
     pub max_samples: Option<usize>,
     pub feature_mode: FeatureMode,
-    pub distillation_features: Option<PathBuf>,
 }
 
-/// Run the evaluation pipeline (always on CPU via `NdArray`).
-pub fn execute_evaluate(args: &EvaluateArgs) -> Result<()> {
-    use burn::backend::ndarray::NdArrayDevice;
-    use burn::backend::NdArray;
+#[derive(Debug, Clone)]
+pub struct MethodResult {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub correlation: Correlation,
+}
 
-    type B = NdArray<f32>;
+#[derive(Debug, Clone)]
+pub struct EvaluationReport {
+    pub checkpoint: PathBuf,
+    pub scoring_head: Option<PathBuf>,
+    pub feature_mode: FeatureMode,
+    pub words_scored: usize,
+    pub words_skipped: usize,
+    pub methods: Vec<MethodResult>,
+}
 
-    let device = NdArrayDevice::default();
-    section("SpeechAligner Checkpoint Evaluation (SpeechOcean762)");
-    let mut resolved_feature_mode = args.feature_mode;
-    let teacher_feature_cache = args
-        .distillation_features
-        .as_ref()
-        .map(|cache_dir| load_teacher_feature_cache(cache_dir))
-        .transpose()?;
-
-    step("Loading checkpoint");
-    let mut scoring_config = ScoringHeadConfig::default();
-    if let Some(path) = args.scoring_head.as_ref() {
-        scoring_config = load_scoring_head_config(path)?;
-        resolved_feature_mode = scoring_config.feature_mode;
-    }
-    let config = SpeechAlignerConfig::for_feature_mode(resolved_feature_mode);
-    let model = load_checkpoint::<B>(&args.checkpoint, &config, &device)?;
-    let param_count: usize = model.num_params();
-    detail(&format!("  Parameters: {param_count}"));
-    detail(&format!(
-        "  Feature mode: {}",
-        resolved_feature_mode.label()
-    ));
-    let scoring_input_dim = scoring_input_dim_from_config(&scoring_config, config.channels[3]);
-    if args.scoring_head.is_some()
-        && matches!(
-            scoring_config.scoring_input_source,
-            ScoringInputSource::TeacherCache
-        )
-        && teacher_feature_cache.is_none()
-    {
-        return Err(Error::config(
-            "Scoring head requires `distillation_features` to replay cached teacher inputs",
-        ));
+impl EvaluationReport {
+    /// Method with the highest Spearman ρ.
+    pub fn best(&self) -> Option<&MethodResult> {
+        self.methods
+            .iter()
+            .max_by(|a, b| a.correlation.spearman.total_cmp(&b.correlation.spearman))
     }
 
-    let (scoring_head, scoring_config) = match args.scoring_head.as_ref() {
-        Some(path) => {
-            step("Loading scoring head");
-            let scoring_head = load_scoring_head_checkpoint::<B>(path, scoring_input_dim, &device)?;
-            detail(&format!("  Parameters: {}", scoring_head.num_params()));
-            detail(&format!(
-                "  Scoring input: {} ({scoring_input_dim} dims)",
-                scoring_config.scoring_input_source.label()
-            ));
-            detail(&format!(
-                "  Scoring mode: {}",
-                if scoring_config.ordinal_loss {
-                    "ordinal"
-                } else if scoring_config.balanced_mse {
-                    "balanced_mse"
-                } else {
-                    "regression"
-                }
-            ));
-            (Some(scoring_head), scoring_config)
+    pub fn to_markdown(&self) -> String {
+        let mut out = String::from("# Evaluation\n\n");
+        let _ = writeln!(out, "- Checkpoint: `{}`", self.checkpoint.display());
+        if let Some(head) = &self.scoring_head {
+            let _ = writeln!(out, "- Scoring head: `{}`", head.display());
         }
-        None => (None, ScoringHeadConfig::default()),
-    };
-
-    step("Loading SpeechOcean762 holdout");
-    let raw = std::fs::read_to_string(&args.dataset)
-        .map_err(|e| Error::config(format!("Cannot read dataset: {e}")))?;
-    let dataset: WordDataset = serde_json::from_str(&raw)
-        .map_err(|e| Error::config(format!("Invalid dataset JSON: {e}")))?;
-
-    let max = args.max_samples.unwrap_or(dataset.samples.len());
-    let limit = max.min(dataset.samples.len());
-    let samples = dataset.samples.get(..limit).unwrap_or(&dataset.samples);
-    detail(&format!(
-        "  Samples: {} (of {} total)",
-        samples.len(),
-        dataset.samples.len()
-    ));
-
-    step("Grouping samples by utterance");
-    let mut utterance_groups: std::collections::BTreeMap<String, Vec<&WordSample>> =
-        std::collections::BTreeMap::new();
-    for s in samples {
-        utterance_groups
-            .entry(s.audio_file.clone())
-            .or_default()
-            .push(s);
+        let _ = writeln!(out, "- Features: {}", self.feature_mode.label());
+        let _ = writeln!(
+            out,
+            "- Words: {} scored, {} skipped\n",
+            self.words_scored, self.words_skipped
+        );
+        out.push_str("| Method | Words | Spearman ρ | 95% CI | Pearson | Description |\n");
+        out.push_str("|---|---|---|---|---|---|\n");
+        for m in &self.methods {
+            let c = &m.correlation;
+            let _ = writeln!(
+                out,
+                "| {} | {} | {:.4} | [{:.4}, {:.4}] | {:.4} | {} |",
+                m.name,
+                c.count,
+                c.spearman,
+                c.spearman_ci95.0,
+                c.spearman_ci95.1,
+                c.pearson,
+                m.description
+            );
+        }
+        out
     }
-    detail(&format!("  Unique utterances: {}", utterance_groups.len()));
+}
 
-    let inference_label = if scoring_head.is_some() {
-        "Running inference (GOP variants + SO762 scoring head)"
-    } else {
-        "Running inference (log-prob + logit + self-aligned GOP)"
+#[derive(Default)]
+struct Scores {
+    predicted: Vec<f64>,
+    human: Vec<f64>,
+    groups: Vec<usize>,
+}
+
+impl Scores {
+    fn push(&mut self, predicted: f64, human: f64, group: usize) {
+        self.predicted.push(predicted);
+        self.human.push(human);
+        self.groups.push(group);
+    }
+
+    fn result(&self, name: &'static str, description: &'static str) -> Option<MethodResult> {
+        (!self.predicted.is_empty()).then(|| MethodResult {
+            name,
+            description,
+            correlation: Correlation::compute(
+                &self.predicted,
+                &self.human,
+                &self.groups,
+                BOOTSTRAP_SAMPLES,
+            ),
+        })
+    }
+}
+
+/// CTC outputs for one utterance, copied to the host.
+struct CtcFrames {
+    log_probs: Vec<f32>,
+    logits: Vec<f32>,
+    frames: usize,
+    classes: usize,
+}
+
+impl CtcFrames {
+    fn row<'a>(&self, data: &'a [f32], frame: usize) -> &'a [f32] {
+        &data[frame * self.classes..(frame + 1) * self.classes]
+    }
+}
+
+pub fn evaluate(config: &EvaluateConfig) -> Result<EvaluationReport> {
+    let device = backend::default_device();
+
+    let head = match &config.scoring_head {
+        Some(path) => {
+            let (head, head_config) = ScoringHead::<InferBackend>::load(path, &device)?;
+            if head_config.input_source != InputSource::Backbone {
+                return Err(Error::config(
+                    "this scoring head reads teacher features; evaluate it with \
+                     `experiments::teacher::evaluate_head`",
+                ));
+            }
+            Some((head, head_config))
+        }
+        None => None,
     };
-    step(inference_label);
-    let mfcc = MfccExtractor::with_mode(resolved_feature_mode);
+    let feature_mode = head
+        .as_ref()
+        .map_or(config.feature_mode, |(_, c)| c.feature_mode);
 
-    let mut logprob_metric = MetricAccumulator::new(
-        "GOPLogProb",
-        "Max log-softmax prob per phoneme",
-        samples.len(),
-    );
-    let mut max_logit_metric =
-        MetricAccumulator::new("GOPMaxLogit", "Max raw logit per phoneme", samples.len());
-    let mut margin_metric = MetricAccumulator::new(
-        "GOPMargin",
-        "Target logit minus next-best logit",
-        samples.len(),
-    );
-    let mut sa_metric = MetricAccumulator::new(
-        "GOP-SA",
-        "Self-aligned CTC pronunciation score",
-        samples.len(),
-    );
-    let mut scoring_head_metric = scoring_head.as_ref().map(|_| {
-        MetricAccumulator::new(
-            "ScoringHead",
-            if scoring_config.ordinal_softmax_loss {
-                "SO762 fine-tuned 5-class ordinal scorer"
-            } else if scoring_config.ordinal_loss {
-                "SO762 fine-tuned threshold-ordinal scorer"
-            } else {
-                "SO762 fine-tuned regression scorer"
-            },
-            samples.len(),
-        )
-    });
-    let mut scored_any_humans: Vec<f64> = Vec::with_capacity(samples.len());
-    let mut skipped = 0usize;
-    let mut processed = 0usize;
-    let total_utterances = utterance_groups.len();
+    let model_config = checkpoint::model_config_for(&config.checkpoint, feature_mode)?;
+    let model = checkpoint::load(
+        model_config.init::<InferBackend>(&device)?,
+        &config.checkpoint,
+        &device,
+    )?;
+    let extractor = MfccExtractor::with_mode(feature_mode);
 
-    for (idx, (audio_path, words)) in utterance_groups.iter().enumerate() {
-        let teacher_frame_features = if scoring_head.is_some()
-            && matches!(
-                scoring_config.scoring_input_source,
-                ScoringInputSource::TeacherCache
-            ) {
-            match teacher_feature_cache
-                .as_ref()
-                .map(|cache| cache.load(audio_path))
-                .transpose()?
-            {
-                Some(Some((teacher_features, teacher_frames))) if teacher_frames > 0 => {
-                    Some(Tensor::<B, 2>::from_data(
-                        burn::tensor::TensorData::new(
-                            teacher_features,
-                            burn::tensor::Shape::new([teacher_frames, scoring_input_dim]),
-                        ),
-                        &device,
-                    ))
+    let words = so762::load(&config.dataset, config.max_samples)?;
+    let groups = so762::group_by_audio(&words);
+    tracing::info!(
+        "evaluating {} words in {} utterances",
+        groups.values().map(Vec::len).sum::<usize>(),
+        groups.len()
+    );
+
+    let mut log_prob = Scores::default();
+    let mut max_logit = Scores::default();
+    let mut margin = Scores::default();
+    let mut self_aligned = Scores::default();
+    let mut head_scores = Scores::default();
+    let (mut scored, mut skipped) = (0usize, 0usize);
+
+    for (utt_idx, (audio_file, utt_words)) in groups.iter().enumerate() {
+        let frames = audio::load(&config.data_root.join(audio_file))
+            .and_then(|samples| extractor.extract_frames(&samples));
+        let frames = match frames {
+            Ok(frames) if !frames.is_empty() => frames,
+            Ok(_) | Err(_) => {
+                if let Err(err) = frames {
+                    tracing::debug!("skipping {audio_file}: {err}");
                 }
-                _ => None,
+                skipped += utt_words.len();
+                continue;
             }
-        } else {
-            None
         };
+        let input = Tensor::<InferBackend, 3>::from_data(
+            TensorData::new(
+                frames.concat(),
+                Shape::new([1, frames.len(), extractor.feature_dim()]),
+            ),
+            &device,
+        );
+        let output = model.forward(input);
+        let ctc = ctc_frames(output.ctc_log_probs, output.ctc_logits);
+        let best_path = ctc_best_path(&ctc);
 
-        let gop_bundle = match load_audio_samples(&args.data_root.join(audio_path)) {
-            Ok(audio) => match mfcc.extract_tensor::<B>(&audio, &device) {
-                Ok(mfcc_tensor) => {
-                    let output = model.forward(mfcc_tensor);
-                    let dims = output.ctc_log_probs.dims();
-                    let num_frames = dims[0];
-                    let num_classes = config.num_classes;
-                    let log_probs: Tensor<B, 2> = output.ctc_log_probs.squeeze();
-                    let raw_logits: Tensor<B, 2> = output.ctc_logits.squeeze();
-                    let frame_features = output.frame_features.clone().squeeze_dim::<2>(0);
-                    match log_probs.clone().into_data().to_vec() {
-                        Ok(lp_data_full) => {
-                            let best_path = ctc_best_path(&lp_data_full, num_frames, num_classes);
-                            Some((
-                                log_probs,
-                                raw_logits,
-                                frame_features,
-                                lp_data_full,
-                                best_path,
-                                num_frames,
-                                num_classes,
-                            ))
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                audio = %audio_path,
-                                "Tensor extraction failed for GOP metrics"
-                            );
-                            None
-                        }
-                    }
-                }
-                Err(_) => None,
-            },
-            Err(_) => None,
-        };
+        let head_word_scores = head.as_ref().map(|(head, head_config)| {
+            let positions: Vec<(usize, usize)> = utt_words
+                .iter()
+                .map(|w| (w.word_position, w.num_words()))
+                .collect();
+            let features = output.frame_features.clone().squeeze_dim::<2>(0);
+            head.score_words(&features, head_config, &positions)
+        });
 
-        for word in words {
-            let scores = gop_bundle.as_ref().and_then(
-                |(log_probs, raw_logits, _, _, _, num_frames, num_classes)| {
-                    compute_word_gop_all::<B>(
-                        log_probs,
-                        raw_logits,
-                        *num_frames,
-                        *num_classes,
-                        &word.phonemes,
-                        &word.sentence_text,
-                        word.word_position,
-                    )
-                },
-            );
-
-            let sa_score = gop_bundle.as_ref().and_then(
-                |(_, _, _, lp_data_full, best_path, num_frames, num_classes)| {
-                    compute_word_gop_sa(
-                        lp_data_full,
-                        best_path,
-                        *num_frames,
-                        *num_classes,
-                        &word.phonemes,
-                        &word.sentence_text,
-                        word.word_position,
-                    )
-                },
-            );
-
-            let backbone_frame_features = gop_bundle
-                .as_ref()
-                .map(|(_, _, frame_features, _, _, _, _)| frame_features);
-            let head_frame_features = if matches!(
-                scoring_config.scoring_input_source,
-                ScoringInputSource::TeacherCache
-            ) {
-                teacher_frame_features.as_ref()
-            } else {
-                backbone_frame_features
+        for (word_idx, word) in utt_words.iter().enumerate() {
+            let Some(span) =
+                proportional_word_frame_span(ctc.frames, word.num_words(), word.word_position)
+            else {
+                skipped += 1;
+                continue;
             };
+            let targets: Vec<usize> = word
+                .phonemes
+                .iter()
+                .filter_map(|p| arpabet_to_idx(p))
+                .map(|idx| idx as usize)
+                .collect();
 
-            let head_score = scoring_head.as_ref().zip(head_frame_features).and_then(
-                |(scoring_head, frame_features)| {
-                    compute_word_scoring_head(
-                        frame_features,
-                        scoring_head,
-                        &scoring_config,
-                        &device,
-                        &word.sentence_text,
-                        word.word_position,
-                    )
-                },
-            );
-
-            let mut word_scored = false;
-            if let Some((lp, ml, mg)) = scores {
-                logprob_metric.push(lp, word.human_score);
-                max_logit_metric.push(ml, word.human_score);
-                margin_metric.push(mg, word.human_score);
-                word_scored = true;
+            let mut any = false;
+            if let Some((lp, ml, mg)) = gop_scores(&ctc, span, &targets) {
+                log_prob.push(lp, word.human_score, utt_idx);
+                max_logit.push(ml, word.human_score, utt_idx);
+                margin.push(mg, word.human_score, utt_idx);
+                any = true;
             }
-            if let Some(sa) = sa_score {
-                sa_metric.push(sa, word.human_score);
-                word_scored = true;
+            if let Some(sa) = gop_self_aligned(&ctc, &best_path, span, &targets) {
+                self_aligned.push(sa, word.human_score, utt_idx);
+                any = true;
             }
-            if let (Some(metric), Some(head_score)) = (scoring_head_metric.as_mut(), head_score) {
-                metric.push(head_score, word.human_score);
-                word_scored = true;
+            if let Some(Some(score)) = head_word_scores.as_ref().map(|s| s[word_idx]) {
+                head_scores.push(f64::from(score), word.human_score, utt_idx);
+                any = true;
             }
-
-            if word_scored {
-                scored_any_humans.push(word.human_score);
-                processed += 1;
+            if any {
+                scored += 1;
             } else {
                 skipped += 1;
             }
         }
-
-        if (idx + 1) % 200 == 0 || idx + 1 == total_utterances {
-            detail(&format!(
-                "  [{}/{}] utterances, {processed} words scored, {skipped} skipped",
-                idx + 1,
-                total_utterances,
-            ));
-        }
     }
 
-    detail(&format!("  Final: {processed} scored, {skipped} skipped"));
-
-    if matches!(
-        scoring_config.scoring_input_source,
-        ScoringInputSource::TeacherCache
-    ) && scoring_head_metric
-        .as_ref()
-        .map_or(0, MetricAccumulator::words_scored)
-        == 0
-    {
-        return Err(Error::config(
-            "Teacher-cache scoring head produced 0 words. Ensure `distillation_features` \
-             contains the evaluation split, not only the training set.",
-        ));
-    }
-
-    if processed < 10 {
-        return Err(Error::process(format!(
-            "Only {processed} words scored — too few for meaningful correlation"
+    if scored < 10 {
+        return Err(Error::data(format!(
+            "only {scored} words could be scored; need at least 10"
         )));
     }
 
-    let correlation_label = if scoring_head_metric.is_some() {
-        "Computing Spearman correlation (4 GOP methods + scoring head)"
-    } else {
-        "Computing Spearman correlation (4 GOP methods)"
-    };
-    step(correlation_label);
-    let mut metrics = Vec::new();
-    metrics.extend(logprob_metric.finalize());
-    metrics.extend(max_logit_metric.finalize());
-    metrics.extend(margin_metric.finalize());
-    metrics.extend(sa_metric.finalize());
-    metrics.extend(
-        scoring_head_metric
-            .as_ref()
-            .and_then(MetricAccumulator::finalize),
-    );
+    let methods = [
+        log_prob.result(
+            "GOP-LogProb",
+            "mean over phonemes of the max log-probability in the word",
+        ),
+        max_logit.result("GOP-MaxLogit", "same with raw logits"),
+        margin.result(
+            "GOP-Margin",
+            "target logit minus the best other logit (blank included)",
+        ),
+        self_aligned.result("GOP-SA", "log-probability over the CTC best-path segment"),
+        head_scores.result("ScoringHead", "fine-tuned scoring head"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
-    let best_metric = metrics
-        .iter()
-        .filter(|metric| metric.words_scored >= 10)
-        .max_by(|a, b| a.rho.total_cmp(&b.rho))
-        .ok_or_else(|| Error::process("No evaluation metrics were produced"))?;
+    Ok(EvaluationReport {
+        checkpoint: config.checkpoint.clone(),
+        scoring_head: config.scoring_head.clone(),
+        feature_mode,
+        words_scored: scored,
+        words_skipped: skipped,
+        methods,
+    })
+}
 
-    let human_mean = scored_any_humans.iter().sum::<f64>() / processed as f64;
-
-    let result_label = if scoring_head.is_some() {
-        "Evaluation Results — GOP + SO762 Scoring Head"
-    } else {
-        "Evaluation Results — 4 GOP Methods"
-    };
-    section(result_label);
-    detail(&format!("  Words evaluated: {processed}"));
-    detail(&format!("  Words skipped:   {skipped}"));
-    detail(&format!("  Human scores:    mean={human_mean:.3}"));
-    detail("");
-    for metric in &metrics {
-        detail(&format!(
-            "  {:<12} ρ={:.4}  PCC={:.4}  CI [{:.4}, {:.4}]  words={}  ({})",
-            metric.name,
-            metric.rho,
-            metric.pcc,
-            metric.ci.0,
-            metric.ci.1,
-            metric.words_scored,
-            metric.description
-        ));
+/// `[frames, 1, classes]` CTC outputs → host vectors.
+fn ctc_frames<B: Backend>(log_probs: Tensor<B, 3>, logits: Tensor<B, 3>) -> CtcFrames {
+    let [frames, _, classes] = log_probs.dims();
+    let to_vec = |t: Tensor<B, 3>| t.into_data().iter::<f32>().collect::<Vec<_>>();
+    CtcFrames {
+        log_probs: to_vec(log_probs),
+        logits: to_vec(logits),
+        frames,
+        classes,
     }
-    detail("");
-    detail(&format!(
-        "  Best method: {} (ρ={:.4}, PCC={:.4})",
-        best_metric.name, best_metric.rho, best_metric.pcc
-    ));
-
-    let (gop_mean, gop_min, gop_max) = if logprob_metric.predicted.is_empty() {
-        (0.0, 0.0, 0.0)
-    } else {
-        let gop_mean =
-            logprob_metric.predicted.iter().sum::<f64>() / logprob_metric.predicted.len() as f64;
-        let gop_min = logprob_metric
-            .predicted
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min);
-        let gop_max = logprob_metric
-            .predicted
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
-        (gop_mean, gop_min, gop_max)
-    };
-    let report = format_report_multi(
-        &args.checkpoint,
-        args.scoring_head.as_deref(),
-        processed,
-        skipped,
-        &metrics,
-        gop_mean,
-        gop_min,
-        gop_max,
-        human_mean,
-        resolved_feature_mode,
-    );
-    let report_path = args
-        .checkpoint
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("evaluation-report.md");
-    std::fs::write(&report_path, &report)
-        .map_err(|e| Error::process(format!("Failed to write report: {e}")))?;
-    detail(&format!("  Report: {}", report_path.display()));
-
-    Ok(())
 }
 
-fn load_checkpoint<B: Backend>(
-    path: &Path,
-    config: &SpeechAlignerConfig,
-    device: &B::Device,
-) -> Result<SpeechAligner<B>> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| Error::config(format!("Cannot read checkpoint {}: {e}", path.display())))?;
-
-    let model = config.init(device)?;
-
-    let recorder = BinBytesRecorder::<FullPrecisionSettings>::default();
-    let record = recorder
-        .load(bytes, device)
-        .map_err(|e| Error::process(format!("Failed to load checkpoint: {e}")))?;
-
-    let model = model.load_record(record);
-    Ok(model)
-}
-
-fn compute_word_scoring_head<B: Backend>(
-    frame_features: &Tensor<B, 2>,
-    scoring_head: &ScoringHead<B>,
-    scoring_config: &ScoringHeadConfig,
-    device: &B::Device,
-    sentence_text: &str,
-    word_position: usize,
-) -> Option<f64> {
-    let dims = frame_features.dims();
-    let num_frames = dims[0];
-    let feature_dim = dims[1];
-    let num_words = sentence_text.split_whitespace().count();
-    let (start, end) = proportional_word_frame_span(num_frames, num_words, word_position)?;
-
-    let span_features = frame_features.clone().slice([start..end, 0..feature_dim]);
-    let score = scoring_predictions_from_logits(
-        scoring_head.forward_word_span(span_features, scoring_config.pooling_mode),
-        scoring_config,
-        device,
-    )
-    .reshape([1]);
-    score
-        .to_data()
-        .to_vec::<f32>()
-        .ok()
-        .and_then(|values| values.into_iter().next())
-        .map(f64::from)
-}
-
-/// Compute all 3 GOP variants for a word: `(log-prob, max-logit, margin)`.
-///
-/// - `GOPLogProb`: max log-softmax probability per target phoneme
-/// - `GOPMaxLogit`: max raw logit per target phoneme (Parikh et al.)
-/// - `GOPMargin`: gap between target phoneme logit and next-highest logit
-fn compute_word_gop_all<B: Backend>(
-    log_probs: &Tensor<B, 2>,  // [time, num_classes] — post log-softmax
-    raw_logits: &Tensor<B, 2>, // [time, num_classes] — pre-softmax
-    num_frames: usize,
-    num_classes: usize,
-    phonemes: &[String],
-    sentence_text: &str,
-    word_position: usize,
+/// `(log-prob, max-logit, margin)` GOP for a word: for each target phoneme,
+/// the best value over the word's frames; then the mean over phonemes.
+fn gop_scores(
+    ctc: &CtcFrames,
+    (start, end): (usize, usize),
+    targets: &[usize],
 ) -> Option<(f64, f64, f64)> {
-    if phonemes.is_empty() {
+    let targets: Vec<usize> = targets
+        .iter()
+        .copied()
+        .filter(|&t| t < ctc.classes)
+        .collect();
+    if targets.is_empty() {
         return None;
     }
-
-    let indices: Vec<i32> = phonemes.iter().filter_map(|p| arpabet_to_idx(p)).collect();
-    if indices.is_empty() {
-        return None;
-    }
-
-    let num_words = sentence_text.split_whitespace().count();
-    let (start_frame, end_frame) =
-        proportional_word_frame_span(num_frames, num_words, word_position)?;
-
-    let word_lp = log_probs
-        .clone()
-        .slice([start_frame..end_frame, 0..num_classes]);
-    let word_rl = raw_logits
-        .clone()
-        .slice([start_frame..end_frame, 0..num_classes]);
-    let lp_data: Vec<f32> = word_lp.into_data().to_vec().ok()?;
-    let rl_data: Vec<f32> = word_rl.into_data().to_vec().ok()?;
-    let word_frames = end_frame - start_frame;
-
-    let mut sum_logprob = 0.0f64;
-    let mut sum_max_logit = 0.0f64;
-    let mut sum_margin = 0.0f64;
-    let mut count = 0usize;
-
-    for &class_idx in &indices {
-        if class_idx < 0 || class_idx as usize >= num_classes {
-            continue;
+    let mut sums = (0.0, 0.0, 0.0);
+    for &target in &targets {
+        let mut best = (f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for frame in start..end {
+            let log_probs = ctc.row(&ctc.log_probs, frame);
+            let logits = ctc.row(&ctc.logits, frame);
+            let best_other = logits
+                .iter()
+                .enumerate()
+                .filter(|&(c, _)| c != target)
+                .map(|(_, &v)| v)
+                .fold(f32::NEG_INFINITY, f32::max);
+            best.0 = best.0.max(f64::from(log_probs[target]));
+            best.1 = best.1.max(f64::from(logits[target]));
+            best.2 = best.2.max(f64::from(logits[target] - best_other));
         }
-        let col = class_idx as usize;
-
-        let mut best_lp = f64::NEG_INFINITY;
-        let mut best_logit = f64::NEG_INFINITY;
-        let mut best_margin = f64::NEG_INFINITY;
-
-        for frame in 0..word_frames {
-            let base = frame * num_classes;
-
-            // GOPLogProb: max log-prob for target phoneme
-            let lp_val = f64::from(
-                lp_data
-                    .get(base + col)
-                    .copied()
-                    .unwrap_or(f32::NEG_INFINITY),
-            );
-            if lp_val > best_lp {
-                best_lp = lp_val;
-            }
-
-            // GOPMaxLogit: max raw logit for target phoneme
-            let logit_val = f64::from(
-                rl_data
-                    .get(base + col)
-                    .copied()
-                    .unwrap_or(f32::NEG_INFINITY),
-            );
-            if logit_val > best_logit {
-                best_logit = logit_val;
-            }
-
-            // GOPMargin: target logit minus max non-target logit
-            let mut max_other = f64::NEG_INFINITY;
-            for c in 0..num_classes {
-                if c != col {
-                    let other =
-                        f64::from(rl_data.get(base + c).copied().unwrap_or(f32::NEG_INFINITY));
-                    if other > max_other {
-                        max_other = other;
-                    }
-                }
-            }
-            let margin = logit_val - max_other;
-            if margin > best_margin {
-                best_margin = margin;
-            }
-        }
-
-        sum_logprob += best_lp;
-        sum_max_logit += best_logit;
-        sum_margin += best_margin;
-        count += 1;
+        sums.0 += best.0;
+        sums.1 += best.1;
+        sums.2 += best.2;
     }
-
-    if count == 0 {
-        return None;
-    }
-
-    let n = count as f64;
-    Some((sum_logprob / n, sum_max_logit / n, sum_margin / n))
+    let n = targets.len() as f64;
+    Some((sums.0 / n, sums.1 / n, sums.2 / n))
 }
 
-/// CTC best-path decoding: argmax at each frame, collapse repeats + blanks.
-/// Returns a `Vec` of `(class_index, start_frame, end_frame)` segments.
-fn ctc_best_path(
-    log_probs: &[f32], // flat [time × num_classes]
-    num_frames: usize,
-    num_classes: usize,
-) -> Vec<(usize, usize, usize)> {
-    if num_frames == 0 || num_classes == 0 || log_probs.len() < num_frames * num_classes {
-        return Vec::new();
-    }
+/// Greedy CTC decoding: per-frame argmax, then merge runs and drop blanks.
+/// Returns `(class, start_frame, end_frame)` segments.
+fn ctc_best_path(ctc: &CtcFrames) -> Vec<(usize, usize, usize)> {
+    let argmax: Vec<usize> = (0..ctc.frames)
+        .map(|frame| {
+            ctc.row(&ctc.log_probs, frame)
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map_or(0, |(c, _)| c)
+        })
+        .collect();
 
-    // Argmax at each frame
-    let mut best_class = Vec::with_capacity(num_frames);
-    for t in 0..num_frames {
-        let base = t * num_classes;
-        let mut max_idx = 0;
-        let mut max_val = f32::NEG_INFINITY;
-        for c in 0..num_classes {
-            let val = log_probs[base + c];
-            if val > max_val {
-                max_val = val;
-                max_idx = c;
-            }
-        }
-        best_class.push(max_idx);
-    }
-
-    // Collapse repeats and blanks (blank = index 0)
     let mut segments = Vec::new();
-    let mut i = 0;
-    while i < num_frames {
-        let cls = best_class[i];
-        if cls == 0 {
-            // blank — skip
-            i += 1;
-            continue;
+    let mut start = 0;
+    while start < argmax.len() {
+        let class = argmax[start];
+        let end = start + argmax[start..].iter().take_while(|&&c| c == class).count();
+        if class != BLANK_IDX as usize {
+            segments.push((class, start, end));
         }
-        let start = i;
-        while i < num_frames && best_class[i] == cls {
-            i += 1;
-        }
-        segments.push((cls, start, i));
+        start = end;
     }
     segments
 }
 
-/// GOP-SA: score each target phoneme using the CTC self-alignment.
-///
-/// For each target phoneme in the word, find the best-path segment that
-/// matches it, then score as the average log-prob at those frames.
-/// If a target phoneme has no matching segment, it gets a deletion penalty.
-fn compute_word_gop_sa(
-    log_probs: &[f32],                   // flat [time × num_classes]
-    best_path: &[(usize, usize, usize)], // (class, start, end)
-    num_frames: usize,
-    num_classes: usize,
-    phonemes: &[String],
-    sentence_text: &str,
-    word_position: usize,
+/// Self-aligned GOP: each target phoneme is scored by its mean log-prob over
+/// the first matching best-path segment inside the word, or
+/// [`GOP_SA_DELETION_SCORE`] if the decoder never emitted it there.
+fn gop_self_aligned(
+    ctc: &CtcFrames,
+    best_path: &[(usize, usize, usize)],
+    (start, end): (usize, usize),
+    targets: &[usize],
 ) -> Option<f64> {
-    if phonemes.is_empty() || log_probs.len() < num_frames * num_classes {
-        return None;
-    }
-
-    let indices: Vec<i32> = phonemes.iter().filter_map(|p| arpabet_to_idx(p)).collect();
-    if indices.is_empty() {
-        return None;
-    }
-
-    let num_words = sentence_text.split_whitespace().count();
-    let (w_start, w_end) = proportional_word_frame_span(num_frames, num_words, word_position)?;
-
-    // Find best-path segments within this word's frame range
-    let word_segments: Vec<&(usize, usize, usize)> = best_path
+    let targets: Vec<usize> = targets
         .iter()
-        .filter(|(_, s, e)| *s < w_end && *e > w_start)
+        .copied()
+        .filter(|&t| t < ctc.classes)
         .collect();
-
-    // For each target phoneme, find matching segment and score
-    let mut total_score = 0.0f64;
-    let mut count = 0usize;
-
-    for &class_idx in &indices {
-        if class_idx < 0 || class_idx as usize >= num_classes {
-            continue;
-        }
-        let target_cls = class_idx as usize;
-
-        // Find the segment in the word's range that matches this phoneme
-        if let Some(&&(_, seg_start, seg_end)) = word_segments
-            .iter()
-            .find(|&&(cls, _, _)| *cls == target_cls)
-        {
-            // Average log-prob for this phoneme across its frames
-            let frame_start = seg_start.max(w_start);
-            let frame_end = seg_end.min(w_end);
-            let mut sum = 0.0f64;
-            let mut n = 0usize;
-            for t in frame_start..frame_end {
-                sum += f64::from(log_probs[t * num_classes + target_cls]);
-                n += 1;
-            }
-            if n > 0 {
-                total_score += sum / n as f64;
-                count += 1;
-            }
-        } else {
-            // Phoneme not found in best-path → low score (deletion)
-            total_score += -20.0; // strong penalty
-            count += 1;
-        }
-    }
-
-    if count == 0 {
+    if targets.is_empty() {
         return None;
     }
-
-    Some(total_score / count as f64)
-}
-
-pub fn spearman_rho(x: &[f64], y: &[f64]) -> f64 {
-    let n = x.len();
-    if n < 2 || x.len() != y.len() {
-        return 0.0;
-    }
-
-    let rx = ranks(x);
-    let ry = ranks(y);
-
-    // Pearson on ranks
-    let avg_rx = rx.iter().sum::<f64>() / n as f64;
-    let avg_ry = ry.iter().sum::<f64>() / n as f64;
-
-    let mut cov = 0.0;
-    let mut var_x = 0.0;
-    let mut var_y = 0.0;
-    for (rx_val, ry_val) in rx.iter().zip(ry.iter()) {
-        let dx = rx_val - avg_rx;
-        let dy = ry_val - avg_ry;
-        cov += dx * dy;
-        var_x += dx * dx;
-        var_y += dy * dy;
-    }
-
-    let denom = (var_x * var_y).sqrt();
-    if denom < 1e-15 {
-        return 0.0;
-    }
-    cov / denom
-}
-
-/// Pearson correlation coefficient (PCC) on raw values.
-///
-/// The standard metric for `SpeechOcean762` comparisons in the literature.
-pub fn pearson_r(x: &[f64], y: &[f64]) -> f64 {
-    let n = x.len();
-    if n < 2 || x.len() != y.len() {
-        return 0.0;
-    }
-
-    let avg_x = x.iter().sum::<f64>() / n as f64;
-    let avg_y = y.iter().sum::<f64>() / n as f64;
-
-    let mut cov = 0.0;
-    let mut var_x = 0.0;
-    let mut var_y = 0.0;
-    for (&xi, &yi) in x.iter().zip(y.iter()) {
-        let dx = xi - avg_x;
-        let dy = yi - avg_y;
-        cov += dx * dy;
-        var_x += dx * dx;
-        var_y += dy * dy;
-    }
-
-    let denom = (var_x * var_y).sqrt();
-    if denom < 1e-15 {
-        return 0.0;
-    }
-    cov / denom
-}
-
-fn ranks(values: &[f64]) -> Vec<f64> {
-    let n = values.len();
-    let mut indexed: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-    let mut result = vec![0.0; n];
-    let mut i = 0;
-    while i < n {
-        let mut j = i;
-        while j < n && (indexed[j].1 - indexed[i].1).abs() < 1e-12 {
-            j += 1;
-        }
-        // Average rank for ties
-        let avg_rank = (i + j + 1) as f64 / 2.0;
-        for item in indexed.iter().take(j).skip(i) {
-            result[item.0] = avg_rank;
-        }
-        i = j;
-    }
-    result
-}
-
-pub fn bootstrap_ci_95(x: &[f64], y: &[f64], n_boot: usize) -> (f64, f64) {
-    let n = x.len();
-    if n < 10 {
-        return (0.0, 0.0);
-    }
-
-    // Simple LCG for reproducible bootstrap
-    let mut rng_state: u64 = 42;
-    let mut rhos: Vec<f64> = Vec::with_capacity(n_boot);
-
-    for _ in 0..n_boot {
-        let mut bx = Vec::with_capacity(n);
-        let mut by = Vec::with_capacity(n);
-        for _ in 0..n {
-            rng_state = rng_state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
-            let idx = ((rng_state >> 33) as usize) % n;
-            bx.push(x[idx]);
-            by.push(y[idx]);
-        }
-        rhos.push(spearman_rho(&bx, &by));
-    }
-
-    if rhos.is_empty() {
-        return (0.0, 0.0);
-    }
-    rhos.sort_by(f64::total_cmp);
-    let last = rhos.len() - 1;
-    let lo_idx = (0.025 * last as f64).round() as usize;
-    let hi_idx = (0.975 * last as f64).round() as usize;
-    (rhos[lo_idx], rhos[hi_idx])
-}
-
-#[allow(clippy::too_many_arguments)]
-fn format_report_multi(
-    checkpoint: &Path,
-    scoring_head: Option<&Path>,
-    scored: usize,
-    skipped: usize,
-    metrics: &[EvaluationMetric],
-    gop_mean: f64,
-    gop_min: f64,
-    gop_max: f64,
-    human_mean: f64,
-    feature_mode: FeatureMode,
-) -> String {
-    use std::fmt::Write as _;
-
-    let best_metric = metrics
+    let total: f64 = targets
         .iter()
-        .filter(|metric| metric.words_scored >= 10)
-        .max_by(|a, b| a.rho.total_cmp(&b.rho));
-    let best_metric = match best_metric {
-        Some(metric) => metric,
-        None => {
-            return String::from("# SpeechAligner Evaluation Report\n\nNo metrics available.\n")
-        }
-    };
-    let mut r = String::new();
-    r.push_str("# SpeechAligner Evaluation Report\n\n");
-    let _ = writeln!(
-        r,
-        "**Date**: {}",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
-    );
-    let _ = writeln!(r, "**Checkpoint**: `{}`", checkpoint.display());
-    if let Some(scoring_head) = scoring_head {
-        let _ = writeln!(r, "**Scoring head**: `{}`", scoring_head.display());
-    }
-    let _ = writeln!(r, "**Feature mode**: {}", feature_mode.label());
-    let _ = writeln!(r, "**Dataset**: SpeechOcean762 holdout (word-level)");
-    let _ = writeln!(r, "**Words Scored**: {scored}");
-    let _ = writeln!(r, "**Words Skipped**: {skipped}");
-    let _ = writeln!(r, "**Human score mean**: {human_mean:.3}");
-    let _ = writeln!(
-        r,
-        "**GOP LogProb mean**: {gop_mean:.3} [{gop_min:.3}, {gop_max:.3}]"
-    );
-    r.push_str("\n---\n\n");
-    r.push_str("## Method Comparison\n\n");
-    r.push_str("| Method | Words | Spearman ρ | Pearson PCC | 95% CI (ρ) | Description |\n");
-    r.push_str("|--------|-------|-----------|------------|------------|-------------|\n");
-    for metric in metrics {
-        let emphasis = if metric.name == best_metric.name {
-            "**"
-        } else {
-            ""
-        };
-        let _ = writeln!(
-            r,
-            "| {emphasis}{}{emphasis} | {} | {emphasis}{:.4}{emphasis} | {:.4} | [{:.4}, \
-             {:.4}] | {} |",
-            metric.name,
-            metric.words_scored,
-            metric.rho,
-            metric.pcc,
-            metric.ci.0,
-            metric.ci.1,
-            metric.description
-        );
-    }
-    let _ = writeln!(
-        r,
-        "\n**Best method**: {} (ρ={:.4}, PCC={:.4})",
-        best_metric.name, best_metric.rho, best_metric.pcc
-    );
-    r
+        .map(|&target| {
+            best_path
+                .iter()
+                .find(|&&(class, s, e)| class == target && s < end && e > start)
+                .map_or(GOP_SA_DELETION_SCORE, |&(_, s, e)| {
+                    let (s, e) = (s.max(start), e.min(end));
+                    (s..e)
+                        .map(|frame| f64::from(ctc.row(&ctc.log_probs, frame)[target]))
+                        .sum::<f64>()
+                        / (e - s) as f64
+                })
+        })
+        .sum();
+    Some(total / targets.len() as f64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::finetune::tests::fake_so762;
 
-    #[test]
-    fn test_spearman_perfect_positive() {
-        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let y = vec![10.0, 20.0, 30.0, 40.0, 50.0];
-        let rho = spearman_rho(&x, &y);
-        assert!((rho - 1.0).abs() < 1e-10, "Expected ρ=1.0, got {rho}");
-    }
-
-    #[test]
-    fn test_spearman_perfect_negative() {
-        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let y = vec![50.0, 40.0, 30.0, 20.0, 10.0];
-        let rho = spearman_rho(&x, &y);
-        assert!((rho - (-1.0)).abs() < 1e-10, "Expected ρ=-1.0, got {rho}");
-    }
-
-    #[test]
-    fn test_spearman_no_correlation() {
-        // Shuffled — low correlation expected
-        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let y = vec![5.0, 1.0, 8.0, 3.0, 7.0, 2.0, 6.0, 4.0];
-        let rho = spearman_rho(&x, &y);
-        assert!(rho.abs() < 0.5, "Expected low ρ, got {rho}");
-    }
-
-    #[test]
-    fn test_spearman_empty_and_single() {
-        assert!((spearman_rho(&[], &[])).abs() < 1e-10);
-        assert!((spearman_rho(&[1.0], &[2.0])).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_spearman_mismatched_lengths() {
-        let rho = spearman_rho(&[1.0, 2.0], &[1.0]);
-        assert!((rho).abs() < 1e-10, "Mismatched lengths should return 0");
-    }
-
-    #[test]
-    fn test_ranks_basic() {
-        let values = vec![3.0, 1.0, 4.0, 1.0, 5.0];
-        let r = ranks(&values);
-        let expected = [3.0, 1.5, 4.0, 1.5, 5.0];
-        // 1.0 appears twice → tied rank = (1+2)/2 = 1.5
-        assert_eq!(r.len(), expected.len());
-        for (actual, target) in r.iter().zip(expected.iter()) {
-            assert!((actual - target).abs() < 1e-10);
+    fn ctc(frames: usize, classes: usize, log_probs: Vec<f32>) -> CtcFrames {
+        CtcFrames {
+            logits: log_probs.clone(),
+            log_probs,
+            frames,
+            classes,
         }
     }
 
     #[test]
-    fn test_ranks_all_equal() {
-        let values = vec![7.0, 7.0, 7.0];
-        let r = ranks(&values);
-        // All tied → average rank = (1+2+3)/3 = 2.0
-        for val in &r {
-            assert!((val - 2.0).abs() < 1e-10);
+    fn best_path_merges_runs_and_drops_blanks() {
+        // Frame argmax: 0 1 1 0 2 2 1
+        let rows = [0, 1, 1, 0, 2, 2, 1];
+        let mut lp = vec![-10.0f32; rows.len() * 3];
+        for (t, &c) in rows.iter().enumerate() {
+            lp[t * 3 + c] = 0.0;
         }
+        let path = ctc_best_path(&ctc(rows.len(), 3, lp));
+        assert_eq!(path, [(1, 1, 3), (2, 4, 6), (1, 6, 7)]);
     }
 
     #[test]
-    fn test_bootstrap_ci_returns_range() {
-        let x: Vec<f64> = (0..100).map(f64::from).collect();
-        let y: Vec<f64> = (0..100).map(f64::from).collect();
-        let (lo, hi) = bootstrap_ci_95(&x, &y, 200);
-        // Perfect correlation → CI should be tight around 1.0
-        assert!(lo > 0.9, "CI lower bound {lo} should be > 0.9");
-        assert!(hi > 0.9, "CI upper bound {hi} should be > 0.9");
-        assert!(lo <= hi, "CI should be ordered: {lo} <= {hi}");
+    fn gop_rewards_present_phonemes() {
+        // Two frames, three classes; class 1 is confident in frame 0.
+        let lp = vec![-5.0, -0.1, -3.0, -0.2, -4.0, -2.0];
+        let c = ctc(2, 3, lp);
+        let (present, _, _) = gop_scores(&c, (0, 2), &[1]).expect("score");
+        let (absent, _, _) = gop_scores(&c, (0, 2), &[2]).expect("score");
+        assert!(present > absent);
+        assert!(gop_scores(&c, (0, 2), &[9]).is_none(), "out-of-range class");
+
+        let path = ctc_best_path(&c);
+        assert!(gop_self_aligned(&c, &path, (0, 2), &[1]).expect("sa") > GOP_SA_DELETION_SCORE);
+        assert_eq!(
+            gop_self_aligned(&c, &path, (0, 2), &[2]),
+            Some(GOP_SA_DELETION_SCORE)
+        );
     }
 
     #[test]
-    fn test_bootstrap_ci_too_few() {
-        let (lo, hi) = bootstrap_ci_95(&[1.0, 2.0], &[1.0, 2.0], 100);
-        assert!((lo).abs() < 1e-10);
-        assert!((hi).abs() < 1e-10);
+    fn evaluates_a_trained_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dataset = fake_so762(dir.path(), "eval", 4);
+        let ft = crate::finetune::finetune(&crate::finetune::FineTuneConfig {
+            dataset: dataset.clone(),
+            data_root: dir.path().to_path_buf(),
+            epochs: 1,
+            warmup_epochs: 0,
+            head_hidden_dim: 8,
+            model: Some(crate::finetune::tests::tiny_backbone()),
+            checkpoint_dir: dir.path().join("ckpt"),
+            ..Default::default()
+        })
+        .expect("finetune");
+
+        let report = evaluate(&EvaluateConfig {
+            checkpoint: ft.final_model,
+            scoring_head: Some(ft.final_head),
+            dataset,
+            data_root: dir.path().to_path_buf(),
+            max_samples: None,
+            feature_mode: FeatureMode::Mfcc39,
+        })
+        .expect("evaluate");
+
+        assert_eq!(report.words_scored, 12);
+        let names: Vec<&str> = report.methods.iter().map(|m| m.name).collect();
+        assert_eq!(
+            names,
+            [
+                "GOP-LogProb",
+                "GOP-MaxLogit",
+                "GOP-Margin",
+                "GOP-SA",
+                "ScoringHead"
+            ]
+        );
+        assert!(report.to_markdown().contains("| ScoringHead | 12 |"));
     }
 }

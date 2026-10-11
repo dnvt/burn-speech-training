@@ -15,7 +15,9 @@ against human pronunciation scores.
 >   within [0.992, 1.0] and gave almost no gradient.
 >
 > The 0.292 result and Rounds 1–5 are unaffected. "Distillation and rank
-> regularization don't help" is **not** established by these runs.
+> regularization don't help" is **not** established by these runs. Both are
+> fixed in `src/experiments/` (`--features experiments`) but have not been
+> re-run.
 
 ---
 

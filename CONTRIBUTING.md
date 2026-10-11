@@ -7,8 +7,8 @@ changes that make it easier to run, read or adapt are the most useful.
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets --features ndarray -- -D warnings
-cargo test --features ndarray
+cargo clippy --all-targets --features experiments -- -D warnings
+cargo test --features experiments
 ```
 
 - Keep examples runnable without private files.
@@ -20,6 +20,6 @@ cargo test --features ndarray
 
 - Dataset loaders for Common Voice or TIMIT.
 - Notes from running the CUDA or WGPU backends on real hardware.
-- A small WAV fixture for end-to-end tests.
+- Resampling so non-16 kHz audio can be used directly.
 
 Contributions are accepted under the project's MIT OR Apache-2.0 license.
